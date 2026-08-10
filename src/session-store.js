@@ -72,6 +72,9 @@ export class SessionStore {
         artifact_revision: normalizeRevision(existing.artifact_revision),
         artifact_failures: Array.isArray(existing.artifact_failures) ? existing.artifact_failures : [],
         dom_snapshot: existing.dom_snapshot || "",
+        // Survives a reopen so `poll --replay-last` can still recover a batch whose payload was
+        // destroyed downstream before the agent read it.
+        last_delivery: existing.last_delivery || null,
         chat: existing.chat || [],
         updated_at: new Date().toISOString(),
       };
@@ -448,6 +451,13 @@ export class SessionStore {
         // knows not to expect (or force) a reopened browser afterward.
         ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
       };
+      // Delivery is destructive: the queue is cleared the moment this result is handed to the
+      // poll response, and the user cannot re-send what the browser already accepted. Anything
+      // that eats the payload after that point - a truncating pipe on the agent's poll, a killed
+      // CLI, a harness that drops stdout - destroys the user's feedback with no trace. Keep the
+      // batch as the last delivery so `poll --replay-last` can re-read it without consuming
+      // anything new. One batch is retained; the next delivery replaces it.
+      session.last_delivery = { ...result, delivered_at: new Date().toISOString() };
       session.prompts = [];
       session.artifact_failures = [];
       session.pending_prompts = 0;
@@ -458,6 +468,23 @@ export class SessionStore {
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
       return result;
+    });
+  }
+
+  // Non-consuming read of the batch `takeFeedback` last handed out. It touches no queue, no
+  // presence and no session status, so replaying is always safe: an agent that lost a payload
+  // recovers it, and an agent that calls this speculatively cannot swallow pending feedback.
+  async readLastDelivery(key) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) {
+        return { status: "missing" };
+      }
+      if (!session.last_delivery) {
+        return { status: "no-delivery" };
+      }
+      return { ...session.last_delivery, replayed: true };
     });
   }
 

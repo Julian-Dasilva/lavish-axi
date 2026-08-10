@@ -2898,6 +2898,53 @@ test("poll on an ended session reports who ended it", async () => {
   }
 });
 
+test("replayLast re-reads the last delivery without consuming or ending the wait", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    const empty = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&replayLast=1`);
+    assert.equal((await empty.json()).status, "no-delivery");
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "ship it", tag: "message" }] }),
+    });
+    const delivered = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal((await delivered.json()).prompts.length, 1);
+
+    // This is the case the agent hits after losing a payload: the queue is empty, but the batch
+    // the user already sent must still be recoverable.
+    const drained = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal((await drained.json()).status, "waiting");
+
+    const replayed = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&replayLast=1`);
+    const body = await replayed.json();
+    assert.equal(body.status, "feedback");
+    assert.equal(body.replayed, true);
+    assert.equal(body.prompts[0].prompt, "ship it");
+
+    // Replaying must not have consumed anything or armed a poll.
+    const after = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal((await after.json()).status, "waiting");
+    const again = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&replayLast=1`);
+    assert.equal((await again.json()).prompts[0].prompt, "ship it");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("send-and-end prompt submissions wake active polls with ended attribution", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");

@@ -31,7 +31,7 @@ function diagnosticPayload(load, sequence, body = {}) {
 
 function feedbackResult(result) {
   assert.equal(result.status, "feedback");
-  return /** @type {{ status: string, dom_snapshot: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string }} */ (
+  return /** @type {{ status: string, dom_snapshot: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string, replayed?: boolean, delivered_at?: string }} */ (
     result
   );
 }
@@ -58,6 +58,45 @@ test("queued prompts are returned with DOM snapshot context and then cleared", a
 
     const second = await store.takeFeedback(session.key);
     assert.equal(second.status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a delivered batch stays replayable after the queue is cleared", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    assert.equal((await store.readLastDelivery(session.key)).status, "no-delivery");
+
+    await store.queuePrompts(session.key, {
+      domSnapshot: 'uid=1 h1 "Hello"',
+      prompts: [{ uid: "1", prompt: "Make this warmer", selector: "h1", tag: "h1", text: "Hello" }],
+    });
+    feedbackResult(await store.takeFeedback(session.key));
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting");
+
+    // The whole point: the payload the agent lost is still readable.
+    const replay = feedbackResult(await store.readLastDelivery(session.key));
+    assert.equal(replay.replayed, true);
+    assert.ok(replay.delivered_at);
+    assert.equal(replay.dom_snapshot, 'uid=1 h1 "Hello"');
+    assert.deepEqual(replay.prompts, [
+      { uid: "1", prompt: "Make this warmer", selector: "h1", tag: "h1", text: "Hello" },
+    ]);
+
+    // Replay is non-consuming, so it can be run twice and it never swallows a live poll.
+    assert.deepEqual((await store.readLastDelivery(session.key)).prompts, replay.prompts);
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting");
+
+    // A reopen must not drop it - the agent may only notice the loss after restarting.
+    await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    assert.deepEqual((await store.readLastDelivery(session.key)).prompts, replay.prompts);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

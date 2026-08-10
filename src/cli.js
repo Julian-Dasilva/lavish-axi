@@ -48,6 +48,12 @@ export const POLL_WAKE_PATH_RULES = Object.freeze([
 ]);
 export const POLL_SEND_AND_END_RULE =
   "`Send & End` ends the session. Its final feedback is still delivered once. After that response, polling stops, and the agent must not reopen the session uninvited.";
+// The queue is cleared the moment the poll answers, and the browser will not let the user re-send
+// a batch it already accepted. So anything that eats the payload after the server answered
+// destroys the user's feedback - and the command still exits 0, which is why this has to be stated
+// rather than left to be discovered.
+export const POLL_DESTRUCTIVE_DELIVERY_RULE =
+  "A poll response is a single destructive delivery: the server clears the queue when it answers. Never pipe `poll` through `head`, `tail`, `grep`, or any other truncating filter, never send its output to /dev/null, and read the whole payload - a truncated response destroys the user's feedback while the command still exits 0. If a payload was lost that way, run `lavish-axi poll <html-file> --replay-last` to re-read the last delivered batch without consuming anything.";
 const CODEX_POLL_WAKE_PATH_GUIDANCE =
   "Codex detected: completed background tasks may not resume Codex automatically, so keep the poll attached to the active turn.";
 // Inlined at build time from package.json; falls back to reading package.json so source-run tests work.
@@ -278,6 +284,27 @@ async function pollCommand(args) {
   const absolute = await canonicalFile(file);
   const baseUrl = await ensureServer();
   const agentReply = flagValue(args, "--agent-reply");
+  // Recovery, not a poll: re-read the last delivered batch and return. It waits for nothing,
+  // consumes nothing, and never posts a reply, so it is safe to run at any point in the loop.
+  if (args.includes("--replay-last")) {
+    if (agentReply) {
+      throw new AxiError("--replay-last cannot be combined with --agent-reply", "VALIDATION_ERROR", [
+        `Run \`lavish-axi poll ${file} --replay-last\` to recover the lost batch first`,
+        `Then run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` as usual`,
+      ]);
+    }
+    // timeoutMs=0 is the version-skew guard, not a timeout. The server is a long-lived daemon
+    // that keeps serving the code it started with, so an upgraded CLI routinely talks to an older
+    // server. One that predates this flag ignores `replayLast` and would long-poll forever on a
+    // recovery command; with timeoutMs=0 it answers `waiting` at once and createReplayOutput turns
+    // that into an actionable error instead of a hang. A server that does support replay answers
+    // before it ever looks at the timeout.
+    const response = await fetchJson(
+      `${baseUrl}/api/poll?file=${encodeURIComponent(absolute)}&replayLast=1&timeoutMs=0`,
+      { retries: 3, retryDelayMs: 500 },
+    );
+    return createReplayOutput({ file: absolute, response, agent: detectInvokingAgent(process.env) });
+  }
   if (agentReply) {
     await postJson(`${baseUrl}/api/${sessionKey(absolute)}/agent-reply`, { text: agentReply });
   }
@@ -337,7 +364,8 @@ export function pollWaitTickText(elapsedMs) {
 export function pollInterruptedText(file) {
   return (
     `[lavish-axi] Poll interrupted before user feedback arrived. The user may still be reviewing - ` +
-    `re-run \`lavish-axi poll ${file}\` to keep waiting; queued feedback is never lost.`
+    `re-run \`lavish-axi poll ${file}\` to keep waiting; queued feedback is never lost. ` +
+    `If an earlier poll already answered and its payload was lost, run \`lavish-axi poll ${file} --replay-last\` to re-read that batch.`
   );
 }
 
@@ -361,12 +389,19 @@ export function startPollWaitReporter({
 }
 
 /**
+ * Field order is load-bearing, not cosmetic. A poll payload is a single destructive delivery: the
+ * server clears the queue when it answers, so whatever the agent fails to read is gone for good.
+ * The irreplaceable fields (the user's prompts, then the instruction that keeps the loop alive)
+ * are emitted first and `dom_snapshot` - by far the largest field, and the only one that can be
+ * re-derived from the artifact itself - is emitted last. Anything downstream that truncates the
+ * payload then loses the snapshot instead of the feedback.
+ *
  * @returns {{
  *   session: { file: string, status: string, session_ended?: boolean, ended_by?: string },
- *   next_step?: string,
- *   dom_snapshot?: string,
  *   prompts?: any[],
  *   artifact_failures?: any[],
+ *   next_step?: string,
+ *   dom_snapshot?: string,
  * }}
  */
 export function createPollOutput({ file, response, agent = "generic" }) {
@@ -385,10 +420,10 @@ export function createPollOutput({ file, response, agent = "generic" }) {
         status: "feedback",
         ...(sessionEnded ? { session_ended: true, ...(endedBy ? { ended_by: endedBy } : {}) } : {}),
       },
-      dom_snapshot: response.dom_snapshot || "",
       prompts: response.prompts || [],
       ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
       next_step: createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, response.prompts || [], agent),
+      dom_snapshot: response.dom_snapshot || "",
     };
   }
   if (response.status === "ended") {
@@ -400,6 +435,50 @@ export function createPollOutput({ file, response, agent = "generic" }) {
   return {
     session: { file, status: response.status || "waiting" },
     next_step: `No user feedback arrived before the optional timeout. Run \`lavish-axi poll ${file}\` without --timeout-ms to wait indefinitely - queued feedback is never lost, so re-running the poll is always safe.`,
+  };
+}
+
+/**
+ * Recovery output for `poll --replay-last`. Same field order and the same prompt shape as a live
+ * delivery so the agent applies it identically, but the status says plainly that this batch was
+ * already delivered once - a replay must never read as fresh user feedback.
+ *
+ * @returns {{
+ *   session: { file: string, status: string, delivered_at?: string, session_ended?: boolean, ended_by?: string },
+ *   prompts?: any[],
+ *   artifact_failures?: any[],
+ *   next_step: string,
+ *   dom_snapshot?: string,
+ * }}
+ */
+export function createReplayOutput({ file, response, agent = "generic" }) {
+  if (response.status === "missing") {
+    throw new AxiError("No active Lavish Editor session for this file", "NOT_FOUND", [
+      `Run \`lavish-axi ${file}\` first`,
+    ]);
+  }
+  // Only a server that predates --replay-last answers a replay request with `waiting`: a server
+  // that understands it returns the delivery, `no-delivery`, or `missing`. Say so, rather than
+  // reporting "nothing to replay" for a batch that may well still be retained.
+  if (response.status === "waiting") {
+    throw new AxiError("This Lavish server is too old to support --replay-last", "VALIDATION_ERROR", [
+      "The running server was started by an earlier version and keeps serving that code",
+      "Run `lavish-axi stop` once no reviews are open, then re-run this command - the next command starts a current server",
+    ]);
+  }
+  if (response.status !== "feedback") {
+    return {
+      session: { file, status: "no-delivery" },
+      next_step: `Lavish has not delivered any feedback for ${file} yet, so there is nothing to replay. Run \`lavish-axi poll ${file}\` without --timeout-ms to wait for the user.`,
+    };
+  }
+  const delivered = createPollOutput({ file, response, agent });
+  return {
+    session: { ...delivered.session, status: "replay", delivered_at: response.delivered_at },
+    prompts: delivered.prompts,
+    ...(delivered.artifact_failures ? { artifact_failures: delivered.artifact_failures } : {}),
+    next_step: `This is the batch Lavish last delivered for ${file}, re-read without consuming anything - it is not new feedback, and the user has not been asked twice. ${delivered.next_step}`,
+    dom_snapshot: delivered.dom_snapshot,
   };
 }
 
@@ -1315,13 +1394,13 @@ export function getCommandHelp(command, { agent = "generic" } = {}) {
 }
 
 function createTopLevelHelp({ agent = "generic" } = {}) {
-  return `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n  lavish-axi setup plugin\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback or ends the session, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}\n\n`;
+  return `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."] [--replay-last]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n  lavish-axi setup plugin\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback or ends the session, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${POLL_DESTRUCTIVE_DELIVERY_RULE} ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}\n\n`;
 }
 
 function createCommandHelp({ agent = "generic" } = {}) {
   return {
     open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
-    poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts. It stays silent while it waits - that is normal, never kill it. Browser-detected layout issues do NOT return this poll: they are filed passively in the user's Layout issues inbox and arrive as an ordinary tag "layout-warnings" prompt only after the user selects them and queues the fixes. Warning lifecycle: an issue stays unresolved and counted while queued, becomes recurring if a newer artifact revision still shows it, and is resolved only after a newer artifact load plus a complete diagnostic pass at the same viewport no longer detects it. A failed or incomplete pass preserves it as unverified rather than clearing it. The only response that arrives without user action is artifact_failures - a fatal failure that made the review surface itself unusable. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. ${POLL_SEND_AND_END_RULE}\n`,
+    poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."] [--replay-last]\n\n${POLL_DESTRUCTIVE_DELIVERY_RULE}\n\nThis command long-polls indefinitely for queued user prompts. It stays silent while it waits - that is normal, never kill it. Browser-detected layout issues do NOT return this poll: they are filed passively in the user's Layout issues inbox and arrive as an ordinary tag "layout-warnings" prompt only after the user selects them and queues the fixes. Warning lifecycle: an issue stays unresolved and counted while queued, becomes recurring if a newer artifact revision still shows it, and is resolved only after a newer artifact load plus a complete diagnostic pass at the same viewport no longer detects it. A failed or incomplete pass preserves it as unverified rather than clearing it. The only response that arrives without user action is artifact_failures - a fatal failure that made the review surface itself unusable. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. ${POLL_SEND_AND_END_RULE}\n`,
     end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,
     export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
     share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Builds the same local-inlined HTML as 'export' (local assets inlined; remote CDN/font URLs left as links and are not blocked by CSP on ht-ml.app, but still load over the viewer's network), then POSTs it to ht-ml.app's /v1 API. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,

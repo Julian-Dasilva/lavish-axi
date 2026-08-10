@@ -242,6 +242,13 @@ export async function serve({
     try {
       const file = await canonicalFile(String(req.query.file || ""));
       const key = sessionKey(file);
+      // Recovery read. It must not consume the queue, arm a poll, or move presence - an agent
+      // whose payload was destroyed downstream re-reads the last delivery and nothing else
+      // changes for the user.
+      if (req.query.replayLast !== undefined) {
+        res.json(await store.readLastDelivery(key));
+        return;
+      }
       const timeoutMs =
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);

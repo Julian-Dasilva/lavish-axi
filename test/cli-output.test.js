@@ -24,6 +24,7 @@ import {
   createOpenOutput,
   createPollOutput,
   createPlaybookOutput,
+  createReplayOutput,
   createServerSpawnOptions,
   createShareOutput,
   createUserEndedOpenOutput,
@@ -1072,6 +1073,73 @@ test("feedback next step keeps the next poll completion observable", () => {
   assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.doesNotMatch(output.next_step, /above 10 minutes/);
+});
+
+test("a truncated poll payload loses the DOM snapshot, never the user's prompts", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: 'uid=1 h1 "Hello"',
+      prompts: [{ uid: "1", prompt: "Tighten the header", selector: "h1", tag: "annotation", text: "Header" }],
+      artifact_failures: [{ kind: "asset", detail: "logo.png 404" }],
+    },
+  });
+
+  // Delivery is destructive, so the order in which fields are emitted decides what a truncating
+  // reader destroys. dom_snapshot is the largest field and the only one re-derivable from the
+  // artifact, so it goes last, behind everything that cannot be recovered.
+  assert.deepEqual(Object.keys(output), ["session", "prompts", "artifact_failures", "next_step", "dom_snapshot"]);
+});
+
+test("poll help states that delivery is destructive and names the recovery path", () => {
+  const help = getCommandHelp("poll", { agent: "generic" });
+
+  assert.match(help, /single destructive delivery/);
+  assert.match(help, /Never pipe `poll` through `head`, `tail`, `grep`/);
+  assert.match(help, /--replay-last/);
+});
+
+test("replay reads as an already-delivered batch, not as fresh feedback", () => {
+  const output = createReplayOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      delivered_at: "2026-08-09T12:00:00.000Z",
+      dom_snapshot: 'uid=1 h1 "Hello"',
+      prompts: [{ uid: "1", prompt: "Tighten the header", selector: "h1", tag: "annotation", text: "Header" }],
+      replayed: true,
+    },
+  });
+
+  assert.equal(output.session.status, "replay");
+  assert.equal(output.session.delivered_at, "2026-08-09T12:00:00.000Z");
+  assert.equal(output.prompts.length, 1);
+  assert.match(output.next_step, /last delivered/);
+  assert.match(output.next_step, /not new feedback/);
+  assert.deepEqual(Object.keys(output), ["session", "prompts", "next_step", "dom_snapshot"]);
+});
+
+test("replay against a server too old to support it errors instead of reporting nothing", () => {
+  // A long-lived server keeps serving the code it started with, so an upgraded CLI routinely
+  // talks to an older one. `waiting` is what that older server answers a replay request with.
+  assert.throws(
+    () => createReplayOutput({ file: "/tmp/report.html", response: { status: "waiting" } }),
+    (error) => {
+      assert.ok(error instanceof AxiError);
+      assert.equal(error.code, "VALIDATION_ERROR");
+      assert.match(error.message, /too old to support --replay-last/);
+      assert.ok(error.suggestions.some((line) => line.includes("lavish-axi stop")));
+      return true;
+    },
+  );
+});
+
+test("replay says so plainly when nothing has been delivered yet", () => {
+  const output = createReplayOutput({ file: "/tmp/report.html", response: { status: "no-delivery" } });
+
+  assert.equal(output.session.status, "no-delivery");
+  assert.match(output.next_step, /nothing to replay/);
 });
 
 test("feedback next step is Codex-aware when requested", () => {
