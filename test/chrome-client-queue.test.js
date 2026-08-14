@@ -5,7 +5,7 @@ import vm from "node:vm";
 
 const sourceUrl = new URL("../src/chrome-client.js", import.meta.url);
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], initialQueuedPrompts?: any[], initialQueuedPromptsVersion?: number, initialAnsweredQuestions?: string[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i" };
 
@@ -31,6 +31,9 @@ async function createChromeHarness({
   const srcLoads = [];
   const beginRequests = [];
   const artifactBeginRequests = [];
+  let observedQueuedPrompts = Array.isArray(sessionData.initialQueuedPrompts)
+    ? sessionData.initialQueuedPrompts.slice()
+    : [];
   const focusLog = [];
   let nextTimerId = 1;
   let reloadCount = 0;
@@ -229,7 +232,12 @@ async function createChromeHarness({
         }),
       };
     }
-    return fetchImpl(url, init);
+    if (String(url).includes("/queued-prompts") && init?.body) {
+      observedQueuedPrompts = JSON.parse(init.body).prompts || [];
+    }
+    const response = await fetchImpl(url, init);
+    if (String(url).endsWith("/prompts") && response.ok) observedQueuedPrompts = [];
+    return response;
   };
 
   const context = {
@@ -366,7 +374,7 @@ async function createChromeHarness({
       return event;
     },
     queued() {
-      return JSON.parse(storage.get("lavish-axi:queued:abc") || "[]");
+      return observedQueuedPrompts;
     },
     reloadCount() {
       return reloadCount;
@@ -540,6 +548,60 @@ test("chrome client scrolls new chat bubbles into view above queued prompts", as
   assert.equal(bubble.scrolledIntoView.block, "nearest");
   assert.equal(bubble.scrolledIntoView.inline, "nearest");
   assert.equal(panelScroll.scrollTop, 640);
+});
+
+test("chrome client restores server-owned queued prompts without browser storage", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: {
+      ...defaultSessionData,
+      initialQueuedPrompts: [
+        {
+          prompt: "Keep this answer",
+          selector: "form#plan",
+          tag: "choice",
+          text: "Pro",
+          _lavishQueueKey: "question:plan",
+          _lavishQuestionKey: "plan",
+        },
+      ],
+      initialQueuedPromptsVersion: 3,
+    },
+  });
+
+  assert.match(chrome.element("annotationPills").innerHTML, /Keep this answer/);
+  assert.equal(chrome.storage.has("lavish-axi:queued:abc"), false);
+});
+
+test("chrome client shows accepted and delivered states for sent messages", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return {
+          ok: true,
+          json: async () => ({
+            chat: [{ role: "user", text: "Use plan B", state: "sent" }],
+            answered_questions: [],
+          }),
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Use plan B", selector: "form#plan", tag: "choice", text: "Plan B" },
+  });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "" });
+  await flushPromises();
+  await flushPromises();
+  assert.match(chrome.element("chatLog").children.at(-1).innerHTML, />sent</);
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ role: "user", text: "Use plan B", state: "delivered" }] }),
+  });
+  assert.match(chrome.element("chatLog").children.at(-1).innerHTML, />delivered</);
 });
 
 function warningPayload(overrides = {}) {
@@ -1568,11 +1630,13 @@ test("chrome client strips the internal queue key before posting prompts", async
   chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
   await flushPromises();
 
-  assert.equal(posts.length, 1);
-  assert.equal(posts[0].url, "/api/abc/prompts");
-  assert.deepEqual(posts[0].body, {
+  const submitted = posts.filter((post) => post.url === "/api/abc/prompts");
+  assert.equal(submitted.length, 1);
+  assert.deepEqual(submitted[0].body, {
     prompts: [{ prompt: "Use plan B", selector: "input#plan-b", tag: "choice", text: "Plan B" }],
     domSnapshot: "uid=1 body",
+    draftVersion: 1,
+    answeredQuestions: [],
   });
   assert.equal(chrome.queued().length, 0);
 });
@@ -1597,13 +1661,13 @@ test("chrome send and end carries the end intent with queued prompts", async () 
   await flushPromises();
   await flushPromises();
 
-  assert.deepEqual(
-    posts.map((post) => post.url),
-    ["/api/abc/prompts"],
-  );
-  assert.deepEqual(posts[0].body, {
+  const submitted = posts.filter((post) => post.url === "/api/abc/prompts");
+  assert.equal(submitted.length, 1);
+  assert.deepEqual(submitted[0].body, {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
+    draftVersion: 1,
+    answeredQuestions: [],
     endSession: true,
   });
   assert.equal(chrome.queued().length, 0);
@@ -1639,7 +1703,7 @@ test("chrome send and end during an in-flight submit still ends after the submit
   const chrome = await createChromeHarness({
     fetchImpl: async (url, init = {}) => {
       posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
-      if (posts.length === 1) await firstPost;
+      if (posts.filter((post) => post.url === "/api/abc/prompts").length === 1) await firstPost;
       return { ok: true };
     },
   });
@@ -1651,26 +1715,26 @@ test("chrome send and end during an in-flight submit still ends after the submit
   chrome.element("send").onclick();
   chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
   await flushPromises();
-  assert.equal(posts.length, 1);
+  assert.equal(posts.filter((post) => post.url === "/api/abc/prompts").length, 1);
 
   chrome.element("sendAndEnd").onclick();
   chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
   await flushPromises();
-  assert.equal(posts.length, 1);
+  assert.equal(posts.filter((post) => post.url === "/api/abc/prompts").length, 1);
 
   resolveFirstPost();
   await flushPromises();
   await flushPromises();
 
-  assert.deepEqual(
-    posts.map((post) => post.url),
-    ["/api/abc/prompts", "/api/abc/end"],
-  );
-  assert.deepEqual(posts[0].body, {
+  const submitted = posts.filter((post) => post.url === "/api/abc/prompts");
+  assert.equal(submitted.length, 1);
+  assert.deepEqual(submitted[0].body, {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
+    draftVersion: 1,
+    answeredQuestions: [],
   });
-  assert.equal(posts[1].body, null);
+  assert.ok(posts.some((post) => post.url === "/api/abc/end"));
   assert.equal(chrome.queued().length, 0);
   assert.equal(chrome.element("chatInput").disabled, true);
 });

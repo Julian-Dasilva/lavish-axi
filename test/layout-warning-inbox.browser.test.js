@@ -494,9 +494,125 @@ test("a live reload preserves the review context Lavish owns", { skip: !runBrows
       chromeEnv,
     );
     assert.match(pills, /Shorten this to one sentence/);
+
+    // The queued prompt is now server-owned, so a fresh iframe document cannot erase it.
+    await writeFile(artifact, `${await readFile(artifact, "utf8")}\n<!-- queued revision -->\n`);
+    wait(5000);
+    const queuedAfterReload = run(
+      "chrome-devtools-axi",
+      ["eval", '[...document.querySelectorAll(".pill-preview")].map((pill) => pill.textContent).join("|")'],
+      chromeEnv,
+    );
+    assert.match(queuedAfterReload, /Shorten this to one sentence/);
   } finally {
     run(process.execPath, ["bin/lavish-axi.js", "stop", "--port", String(port)], lavishEnv, 15_000);
     run("chrome-devtools-axi", ["stop"], chromeEnv);
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test(
+  "answered questions collapse and feedback moves from sent to delivered in a real browser",
+  { skip: !runBrowserE2e, timeout: 240_000 },
+  async () => {
+    const temp = await mkdtemp(path.join(tmpdir(), "lavish-question-closeout-"));
+    const port = await freePort();
+    const lavishEnv = {
+      LAVISH_AXI_PORT: String(port),
+      LAVISH_AXI_STATE_DIR: path.join(temp, "state"),
+      LAVISH_AXI_NO_OPEN: "1",
+      LAVISH_AXI_TELEMETRY: "0",
+      LAVISH_AXI_HOST: "127.0.0.1",
+      LAVISH_AXI_LINK_HOST: "127.0.0.1",
+    };
+    const chromeEnv = {
+      CHROME_DEVTOOLS_AXI_SESSION: `lavish-question-closeout-${process.pid}`,
+      CHROME_DEVTOOLS_AXI_USER_DATA_DIR: path.join(temp, "chrome"),
+    };
+
+    function snapshot() {
+      return run("chrome-devtools-axi", ["snapshot"], chromeEnv);
+    }
+    function ref(pattern) {
+      const line = snapshot()
+        .split("\n")
+        .find((candidate) => pattern.test(candidate));
+      assert.ok(line, `no snapshot line matching ${pattern}`);
+      return line.trim().split(/\s+/)[0].replace(/^uid=/, "");
+    }
+    function click(pattern) {
+      run("chrome-devtools-axi", ["click", `@${ref(pattern)}`], chromeEnv);
+    }
+    function wait(ms) {
+      run("chrome-devtools-axi", ["wait", String(ms)], chromeEnv, ms + 45_000);
+    }
+
+    try {
+      const artifact = path.join(temp, "question.html");
+      await writeFile(
+        artifact,
+        `<!doctype html><html><body><main>
+          <form data-lavish-question="plan" onsubmit="event.preventDefault(); const choice = new FormData(event.currentTarget).get('plan'); if (choice) window.lavish.queuePrompt('Use the ' + choice + ' plan', { tag: 'choice', text: 'Plan: ' + choice, element: event.currentTarget, data: { question: 'plan', answer: choice } });">
+            <fieldset><legend>Which plan?</legend>
+              <label><input type="radio" name="plan" value="Starter"> Starter</label>
+              <label><input type="radio" name="plan" value="Pro"> Pro</label>
+              <button type="submit">Queue this answer</button>
+            </fieldset>
+          </form>
+        </main></body></html>`,
+      );
+      const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open"], lavishEnv);
+      const url = output.match(/url:\s*"([^"]+)"/)?.[1];
+      assert.ok(url, output);
+      run("chrome-devtools-axi", ["open", url], chromeEnv);
+      wait(3500);
+
+      click(/radio " Pro"/);
+      click(/button "Queue this answer"/);
+      wait(1000);
+      assert.match(
+        run(
+          "chrome-devtools-axi",
+          ["eval", '[...document.querySelectorAll(".pill-preview")].map((pill) => pill.textContent).join("|")'],
+          chromeEnv,
+        ),
+        /Use the Pro plan/,
+      );
+
+      click(/button "Send to Agent"/);
+      wait(1200);
+      const sent = snapshot();
+      assert.match(sent, /Use the Pro plan/);
+      assert.match(sent, /sent/);
+      assert.match(sent, /Answered: plan/);
+      assert.match(sent, /button "Reopen answered question plan"/);
+      assert.doesNotMatch(sent, /radio " Pro" checked/);
+
+      const pollOutput = run(
+        process.execPath,
+        ["bin/lavish-axi.js", "poll", artifact, "--timeout-ms", "8000"],
+        lavishEnv,
+        53_000,
+      );
+      assert.match(pollOutput, /Use the Pro plan/);
+      wait(1000);
+      assert.match(snapshot(), /delivered/);
+
+      run("chrome-devtools-axi", ["open", url], chromeEnv);
+      wait(3500);
+      const persisted = snapshot();
+      assert.match(persisted, /Answered: plan/);
+      assert.doesNotMatch(persisted, /radio " Pro" checked/);
+
+      click(/button "Reopen answered question plan"/);
+      wait(500);
+      const reopened = snapshot();
+      assert.match(reopened, /button "Queue this answer"/);
+      assert.doesNotMatch(reopened, /Answered: plan/);
+    } finally {
+      run(process.execPath, ["bin/lavish-axi.js", "stop", "--port", String(port)], lavishEnv, 15_000);
+      run("chrome-devtools-axi", ["stop"], chromeEnv);
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);

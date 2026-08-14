@@ -19,6 +19,8 @@ import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./
 
 export const LAYOUT_WARNINGS_TARGET_TYPE = "layout-warnings";
 const MAX_ARTIFACT_FAILURES = 20;
+const MAX_QUEUED_PROMPTS = 200;
+const MAX_ANSWERED_QUESTIONS = 200;
 
 export class SessionStore {
   constructor(file) {
@@ -66,6 +68,12 @@ export class SessionStore {
         status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
         pending_prompts: existing.pending_prompts || 0,
         prompts: existingPrompts,
+        pending_prompt_ids: Array.isArray(existing.pending_prompt_ids)
+          ? existing.pending_prompt_ids.map((id) => String(id || "")).filter(Boolean)
+          : [],
+        queued_prompts: normalizeQueuedPrompts(existing.queued_prompts),
+        queued_prompts_version: normalizeDraftVersion(existing.queued_prompts_version),
+        answered_questions: normalizeQuestionKeys(existing.answered_questions),
         // The warning inbox is durable review state, not deliverable feedback: reopening a session
         // must never silently drop unresolved warnings the user has not triaged yet.
         layout_warnings: normalizeStoredWarnings(existing.layout_warnings),
@@ -76,6 +84,41 @@ export class SessionStore {
         updated_at: new Date().toISOString(),
       };
       state.sessions[key] = session;
+      await this.writeState(state);
+      return session;
+    });
+  }
+
+  async saveQueuedPrompts(key, payload = {}) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+
+      const version = normalizeDraftVersion(payload.version);
+      const currentVersion = normalizeDraftVersion(session.queued_prompts_version);
+      if (version > 0 && version < currentVersion) return session;
+
+      session.queued_prompts = normalizeQueuedPrompts(payload.prompts);
+      session.queued_prompts_version = version > 0 ? version : currentVersion + 1;
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return session;
+    });
+  }
+
+  async setAnsweredQuestion(key, question, answered) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      const questionKey = normalizeQuestionKey(question);
+      if (!questionKey) return session;
+      const questions = new Set(normalizeQuestionKeys(session.answered_questions));
+      if (answered) questions.add(questionKey);
+      else questions.delete(questionKey);
+      session.answered_questions = [...questions].slice(0, MAX_ANSWERED_QUESTIONS);
+      session.updated_at = new Date().toISOString();
       await this.writeState(state);
       return session;
     });
@@ -133,11 +176,25 @@ export class SessionStore {
         if (result.queued.length > 0 || !plan.hadKnownWarning) acceptedPrompts.push(plan.prompt);
       }
       session.layout_warnings = warnings;
-      const userMessages = acceptedPrompts
-        .filter((prompt) => prompt.tag === "message" && prompt.prompt)
-        .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
+      const promptIds = acceptedPrompts.map(() => crypto.randomBytes(12).toString("base64url"));
+      const userMessages = acceptedPrompts.map((prompt, index) => ({
+        role: "user",
+        text: prompt.prompt || prompt.text || "Feedback",
+        state: "sent",
+        prompt_id: promptIds[index],
+        at: new Date().toISOString(),
+      }));
       session.prompts = [...(session.prompts || []), ...acceptedPrompts];
+      session.pending_prompt_ids = [...(session.pending_prompt_ids || []), ...promptIds];
       session.chat = [...(session.chat || []), ...userMessages];
+      const answeredQuestions = normalizeQuestionKeys(payload.answeredQuestions || payload.answered_questions);
+      session.answered_questions = normalizeQuestionKeys([...(session.answered_questions || []), ...answeredQuestions]);
+      const submittedVersion = normalizeDraftVersion(payload.draftVersion || payload.queuedPromptsVersion);
+      const currentDraftVersion = normalizeDraftVersion(session.queued_prompts_version);
+      if (!submittedVersion || submittedVersion >= currentDraftVersion) {
+        session.queued_prompts = [];
+        if (submittedVersion > currentDraftVersion) session.queued_prompts_version = submittedVersion;
+      }
       session.pending_prompts = session.prompts.length;
       session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
       session.status = shouldEndSession || alreadyEnded ? "ended" : session.prompts.length > 0 ? "feedback" : "open";
@@ -443,12 +500,21 @@ export class SessionStore {
         status: "feedback",
         dom_snapshot: session.dom_snapshot || "",
         prompts,
+        chat: [],
         ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
         // This is the final delivery before the session shows as ended - flag it so the agent
         // knows not to expect (or force) a reopened browser afterward.
         ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
       };
+      const deliveredPromptIds = new Set(session.pending_prompt_ids || []);
+      if (deliveredPromptIds.size > 0) {
+        session.chat = (session.chat || []).map((item) =>
+          deliveredPromptIds.has(item.prompt_id) ? { ...item, state: "delivered" } : item,
+        );
+      }
+      result.chat = session.chat || [];
       session.prompts = [];
+      session.pending_prompt_ids = [];
       session.artifact_failures = [];
       session.pending_prompts = 0;
       session.dom_snapshot = "";
@@ -547,6 +613,42 @@ function normalizePrompt(prompt) {
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;
   return normalized;
+}
+
+function normalizeQueuedPrompts(prompts) {
+  if (!Array.isArray(prompts)) return [];
+  return prompts
+    .filter((prompt) => prompt && typeof prompt === "object" && !Array.isArray(prompt))
+    .slice(0, MAX_QUEUED_PROMPTS)
+    .map((prompt) => {
+      const normalized = normalizePrompt(prompt);
+      const queueKey = String(prompt._lavishQueueKey || "")
+        .trim()
+        .slice(0, 300);
+      const questionKey = String(prompt._lavishQuestionKey || "")
+        .trim()
+        .slice(0, 200);
+      if (queueKey) normalized._lavishQueueKey = queueKey;
+      if (questionKey) normalized._lavishQuestionKey = questionKey;
+      return normalized;
+    });
+}
+
+function normalizeQuestionKey(value) {
+  const normalized = String(value || "")
+    .trim()
+    .slice(0, 200);
+  return normalized;
+}
+
+function normalizeQuestionKeys(values) {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values.map(normalizeQuestionKey).filter(Boolean))].slice(0, MAX_ANSWERED_QUESTIONS);
+}
+
+function normalizeDraftVersion(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : 0;
 }
 
 function layoutWarningPromptIds(prompt) {

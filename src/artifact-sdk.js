@@ -686,13 +686,16 @@ export function createArtifactSdk(
 
   function queuePrompt(prompt, options = {}) {
     const originElement = options.element || document.activeElement || document.body;
-    /** @type {{ uid: string, prompt: string, selector: string, tag: string, text: string, target?: unknown, _lavishQueueKey?: string }} */
+    /** @type {{ uid: string, prompt: string, selector: string, tag: string, text: string, target?: unknown, _lavishQueueKey?: string, _lavishQuestionKey?: string }} */
     const item = {
       ...context(originElement),
       prompt: String(prompt || ""),
     };
     const queueKey = typeof deriveQueueKey === "function" ? deriveQueueKey(originElement, options) : "";
     if (queueKey) item._lavishQueueKey = String(queueKey);
+    const question = originElement?.closest?.("[data-lavish-question]");
+    const questionKey = String(question?.getAttribute?.("data-lavish-question") || "").trim();
+    if (questionKey) item._lavishQuestionKey = questionKey;
 
     if (options.uid) item.uid = String(options.uid);
     if (options.selector) item.selector = String(options.selector);
@@ -1536,6 +1539,69 @@ export function createArtifactSdk(
 
   let activeCardContext = null;
   let reviewStateTimer = 0;
+  const answeredQuestionKeys = new Set();
+  let questionStyleInstalled = false;
+
+  function installQuestionStyle() {
+    if (questionStyleInstalled || !document.head) return;
+    questionStyleInstalled = true;
+    const style = document.createElement("style");
+    style.setAttribute("data-lavish-ui", "question-closeout-style");
+    style.textContent =
+      "[data-lavish-question][data-lavish-question-answered] > :not([data-lavish-question-summary]){display:none!important}" +
+      ";[data-lavish-question-summary]{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;margin:0 0 8px;border:1px solid currentColor;border-radius:8px;font:600 13px/1.3 system-ui,sans-serif}" +
+      ";[data-lavish-question-summary] button{font:inherit;cursor:pointer}";
+    document.head.appendChild(style);
+  }
+
+  function questionSummary(scope, questionKey) {
+    let summary = scope.querySelector("[data-lavish-question-summary]");
+    if (!summary) {
+      summary = document.createElement("div");
+      summary.setAttribute("data-lavish-question-summary", "true");
+      summary.setAttribute("data-lavish-ui", "question-summary");
+      const label = document.createElement("span");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.addEventListener("click", () => {
+        answeredQuestionKeys.delete(questionKey);
+        updateAnsweredQuestion(scope, questionKey);
+        postArtifactMessage("lavish:questionReopened", { question: questionKey });
+      });
+      summary.appendChild(label);
+      summary.appendChild(button);
+      scope.insertBefore(summary, scope.firstChild);
+    }
+    const label = summary.querySelector("span");
+    const button = summary.querySelector("button");
+    if (label) label.textContent = "Answered: " + questionKey;
+    if (button) {
+      button.textContent = "Reopen";
+      button.setAttribute("aria-label", "Reopen answered question " + questionKey);
+    }
+    return summary;
+  }
+
+  function updateAnsweredQuestion(scope, questionKey) {
+    installQuestionStyle();
+    const answered = answeredQuestionKeys.has(questionKey);
+    scope.toggleAttribute("data-lavish-question-answered", answered);
+    const summary = questionSummary(scope, questionKey);
+    summary.hidden = !answered;
+    summary.setAttribute("aria-live", "polite");
+  }
+
+  function restoreAnsweredQuestions(questions) {
+    answeredQuestionKeys.clear();
+    for (const question of Array.isArray(questions) ? questions : []) {
+      const key = String(question || "").trim();
+      if (key) answeredQuestionKeys.add(key);
+    }
+    for (const scope of document.querySelectorAll("[data-lavish-question]")) {
+      const key = String(scope.getAttribute("data-lavish-question") || "").trim();
+      if (key) updateAnsweredQuestion(scope, key);
+    }
+  }
 
   function safeQuerySelector(selector) {
     try {
@@ -1757,6 +1823,7 @@ export function createArtifactSdk(
     if (msg.type === "lavish:requestSnapshot") {
       postArtifactMessage("lavish:snapshot", { snapshot: snapshot() });
     }
+    if (msg.type === "lavish:restoreAnsweredQuestions") restoreAnsweredQuestions(msg.questions);
     if (msg.type === "lavish:restoreScroll") {
       window.scrollTo(Number(msg.x) || 0, Number(msg.y) || 0);
     }

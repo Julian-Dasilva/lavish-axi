@@ -970,6 +970,23 @@ body.lavish {
 .bubble.user small {
   text-align: right;
 }
+.message-state {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  font-weight: var(--w-medium);
+}
+.message-state.sent {
+  color: var(--accent);
+}
+.message-state.delivered {
+  color: var(--success, #7fcf9b);
+}
+.message-state.pending {
+  color: var(--fg-faint);
+}
 @keyframes spin {
   to {
     transform: rotate(360deg);
