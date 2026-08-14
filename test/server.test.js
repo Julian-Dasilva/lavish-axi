@@ -166,6 +166,14 @@ test("artifact SDK uses a custom annotation card instead of browser prompts", ()
   assert.match(js, /textarea/);
 });
 
+test("artifact SDK exposes the persisted answered-question closeout and native reopen path", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /lavish-question-summary/);
+  assert.match(js, /lavish:questionReopened/);
+  assert.match(js, /lavish:restoreAnsweredQuestions/);
+});
+
 test("artifact SDK script is valid JavaScript", () => {
   const js = createSdkJs("abc");
 
@@ -623,6 +631,22 @@ test("chrome bootstraps persisted chat history so missed replies still appear", 
   assert.match(html, /Persisted reply/);
 });
 
+test("chrome bootstrap carries server-owned unsent prompts and answered questions", () => {
+  const html = createChromeHtml({
+    key: "abc",
+    file: "/tmp/artifact.html",
+    queued_prompts: [{ uid: "1", prompt: "Keep this", selector: "form#plan", tag: "choice", text: "Pro" }],
+    queued_prompts_version: 4,
+    answered_questions: ["plan"],
+  });
+
+  assert.match(html, /initialQueuedPrompts/);
+  assert.match(html, /initialQueuedPromptsVersion/);
+  assert.match(html, /initialAnsweredQuestions/);
+  assert.match(html, /Keep this/);
+  assert.match(html, /plan/);
+});
+
 test("chrome client renders persisted chat history", async () => {
   const js = await chromeClientSource();
 
@@ -892,13 +916,13 @@ test("chrome waits for the replacement server before version-driven reload", asy
   assert.match(js, /addEventListener\("chrome-reload", \(\) => reloadAfterServerRestart\(\)\)/);
 });
 
-test("chrome restores queued prompts from tab storage after reload", async () => {
+test("chrome restores queued prompts from the server bootstrap after reload", async () => {
   const js = await chromeClientSource();
 
-  assert.match(js, /lavish-axi:queued:/);
-  assert.match(js, /function loadQueuedPrompts\(\)/);
-  assert.match(js, /const queued = loadQueuedPrompts\(\)/);
-  assert.match(js, /sessionStorage\.getItem\(queueStorageKey\)/);
+  assert.match(js, /initialQueuedPrompts/);
+  assert.match(js, /const queued = initialQueuedPrompts/);
+  assert.match(js, /\/queued-prompts/);
+  assert.doesNotMatch(js, /queueStorageKey/);
 });
 
 test("chrome keeps queued prompts persisted until submit succeeds", async () => {

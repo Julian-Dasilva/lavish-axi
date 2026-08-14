@@ -4,12 +4,16 @@ const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
-const queueStorageKey = "lavish-axi:queued:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
 // triage can never leak into another artifact's.
 const warningSelectionStorageKey = "lavish-axi:warning-selection:" + key;
 const internalQueueKeyField = "_lavishQueueKey";
+const internalQuestionKeyField = "_lavishQuestionKey";
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
+const initialQueuedPrompts = Array.isArray(sessionData.initialQueuedPrompts) ? sessionData.initialQueuedPrompts : [];
+const initialAnsweredQuestions = Array.isArray(sessionData.initialAnsweredQuestions)
+  ? sessionData.initialAnsweredQuestions.map((question) => String(question || "")).filter(Boolean)
+  : [];
 const MODE_TOGGLE_HOTKEY_KEY = String(sessionData.modeToggleHotkeyKey || "").toLowerCase();
 
 function isModeToggleHotkeyEvent(event) {
@@ -72,7 +76,8 @@ const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElem
 const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardError"));
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
-const queued = loadQueuedPrompts();
+const queued = initialQueuedPrompts.filter((prompt) => prompt && typeof prompt === "object");
+let queuedPromptsVersion = Number(sessionData.initialQueuedPromptsVersion) || 0;
 let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
@@ -120,6 +125,8 @@ let artifactSilenceTimer;
 let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
+let queuedPromptsSyncPromise = null;
+let answeredQuestions = new Set(initialAnsweredQuestions);
 
 function artifactFrameSrcForLoad(load) {
   const separator = artifactSrc.includes("?") ? "&" : "?";
@@ -164,25 +171,22 @@ function saveJsonState(storageKey, value) {
   }
 }
 
-function loadQueuedPrompts() {
-  try {
-    const parsed = JSON.parse(sessionStorage.getItem(queueStorageKey) || "[]");
-    return Array.isArray(parsed) ? parsed.filter((prompt) => prompt && typeof prompt === "object") : [];
-  } catch {
-    return [];
-  }
-}
-
-function persistQueuedPrompts() {
-  try {
-    if (queued.length) {
-      sessionStorage.setItem(queueStorageKey, JSON.stringify(queued));
-    } else {
-      sessionStorage.removeItem(queueStorageKey);
-    }
-  } catch {
-    // The in-memory queue still works if browser storage is unavailable.
-  }
+function syncQueuedPrompts() {
+  const version = ++queuedPromptsVersion;
+  const body = JSON.stringify({
+    prompts: queued,
+    version,
+  });
+  const request = fetch("/api/" + key + "/queued-prompts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  }).catch(() => {});
+  queuedPromptsSyncPromise = request;
+  request.finally(() => {
+    if (queuedPromptsSyncPromise === request) queuedPromptsSyncPromise = null;
+  });
+  return request;
 }
 
 function render() {
@@ -268,12 +272,16 @@ async function copyText(text) {
   return true;
 }
 
-function addChat(role, text, shouldScroll = true) {
+function addChat(role, text, shouldScroll = true, state = "") {
   if (!text) return;
 
   const el = document.createElement("div");
   el.className = "bubble " + role;
-  el.innerHTML = "<small>" + (role === "agent" ? "Agent" : "You") + "</small><div>" + escapeHtml(text) + "</div>";
+  const stateLabel = state
+    ? '<span class="message-state ' + escapeHtml(state) + '" role="status">' + escapeHtml(state) + "</span>"
+    : "";
+  el.innerHTML =
+    "<small>" + (role === "agent" ? "Agent" : "You") + stateLabel + "</small><div>" + escapeHtml(text) + "</div>";
   chatLog.appendChild(el);
   if (shouldScroll) scrollElementIntoView(el);
   return el;
@@ -285,13 +293,20 @@ function syncChat(chat) {
   }
 
   let lastChatBubble = null;
-  for (const item of chat) lastChatBubble = addChat(item.role, item.text, false) || lastChatBubble;
+  for (const item of chat) lastChatBubble = addChat(item.role, item.text, false, item.state) || lastChatBubble;
   if (workingBubble) {
     chatLog.appendChild(workingBubble);
     scrollElementIntoView(workingBubble);
   } else if (lastChatBubble) {
     scrollElementIntoView(lastChatBubble);
   }
+}
+
+function setAnsweredQuestions(next) {
+  answeredQuestions = new Set(
+    (Array.isArray(next) ? next : []).map((question) => String(question || "").trim()).filter(Boolean),
+  );
+  postToFrame({ type: "lavish:restoreAnsweredQuestions", questions: [...answeredQuestions] });
 }
 
 function setAgentPresence(state) {
@@ -323,7 +338,7 @@ async function refreshChromeLoadHandoff(requestSequence) {
     method: "POST",
     headers: { "content-type": "application/json" },
   });
-  const data = await response.json().catch(() => ({}));
+  const data = typeof response.json === "function" ? await response.json().catch(() => ({})) : {};
   const token = String(data?.chrome_load_token || "");
   if (!response.ok || !token) throw new Error("failed to refresh chrome handoff");
   if (requestSequence !== artifactLoadRequestSequence || ended) return false;
@@ -346,7 +361,7 @@ function scrollElementIntoView(el) {
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
   queued.splice(index, 1);
-  persistQueuedPrompts();
+  syncQueuedPrompts();
   render();
 }
 
@@ -369,7 +384,7 @@ function enqueuePrompt(prompt) {
     queued.push(prompt);
   }
 
-  persistQueuedPrompts();
+  syncQueuedPrompts();
   render();
 }
 
@@ -377,7 +392,19 @@ function stripInternalPromptFields(prompt) {
   if (!prompt || typeof prompt !== "object") return prompt;
   const clean = { ...prompt };
   delete clean[internalQueueKeyField];
+  delete clean[internalQuestionKeyField];
   return clean;
+}
+
+function questionKeyForPrompt(prompt) {
+  const explicit = String(prompt?.[internalQuestionKeyField] || "").trim();
+  if (explicit) return explicit;
+  const queueKey = promptQueueKey(prompt);
+  return queueKey.startsWith("question:") ? queueKey.slice("question:".length).trim() : "";
+}
+
+function answeredQuestionKeysForPrompts(prompts) {
+  return [...new Set(prompts.map(questionKeyForPrompt).filter(Boolean))];
 }
 
 function postToFrame(message) {
@@ -396,8 +423,8 @@ function sendQueued(endAfter) {
   const text = chatInput.value.trim();
   if (text) {
     queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
-    persistQueuedPrompts();
-    addChat("user", text);
+    syncQueuedPrompts();
+    addChat("user", text, true, "pending");
     chatInput.value = "";
     render();
   }
@@ -442,8 +469,14 @@ async function submitQueued() {
 
 async function submitQueuedOnce() {
   const prompts = queued.slice();
+  if (queuedPromptsSyncPromise) await queuedPromptsSyncPromise;
   const shouldEndSession = endAfterSubmit;
-  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
+  const body = {
+    prompts: prompts.map(stripInternalPromptFields),
+    domSnapshot: pendingSnapshot,
+    draftVersion: queuedPromptsVersion,
+    answeredQuestions: answeredQuestionKeysForPrompts(prompts),
+  };
   if (shouldEndSession) body.endSession = true;
   const response = await fetch("/api/" + key + "/prompts", {
     method: "POST",
@@ -459,11 +492,13 @@ async function submitQueuedOnce() {
     }
     throw new Error("failed to submit queued prompts");
   }
+  const data = typeof response.json === "function" ? await response.json().catch(() => ({})) : {};
   for (const prompt of prompts) {
     const index = queued.indexOf(prompt);
     if (index !== -1) queued.splice(index, 1);
   }
-  persistQueuedPrompts();
+  if (Array.isArray(data.answered_questions)) setAnsweredQuestions(data.answered_questions);
+  if (Array.isArray(data.chat)) syncChat(data.chat);
   render();
   if (shouldEndSession) {
     endAfterSubmit = false;
@@ -1730,6 +1765,21 @@ window.addEventListener("message", (event) => {
   if (msg.type === "lavish:reviewState") {
     lastReviewState = msg.state && typeof msg.state === "object" ? msg.state : null;
   }
+  if (msg.type === "lavish:questionReopened") {
+    const question = String(msg.question || "").trim();
+    if (question) {
+      fetch("/api/" + key + "/answered-questions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ question, answered: false }),
+      })
+        .then((response) => response.json())
+        .then((data) => {
+          if (Array.isArray(data?.answered_questions)) setAnsweredQuestions(data.answered_questions);
+        })
+        .catch(() => {});
+    }
+  }
   if (msg.type === "lavish:artifactAssetFailure") {
     reportArtifactFailures(
       [{ kind: "artifact-asset-unavailable", detail: String(msg.detail || "a local artifact asset failed to load") }],
@@ -1828,6 +1878,7 @@ frame.addEventListener("load", () => {
   // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.
   postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
   if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
+  postToFrame({ type: "lavish:restoreAnsweredQuestions", questions: [...answeredQuestions] });
   if (overlayIndex !== null) {
     inlineWhiteboardChannels.delete(overlayIndex);
     postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: overlayIndex });

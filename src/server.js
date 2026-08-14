@@ -153,6 +153,14 @@ export async function serve({
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
   let publicPort = port;
 
+  function finishFeedbackDelivery(key, result) {
+    if (result.status !== "feedback") return;
+    const chat = result.chat;
+    delete result.chat;
+    markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+    if (Array.isArray(chat)) events.emit("chat-sync", key, chat);
+  }
+
   // Whiteboard sidecar files live next to state.json, keyed by session + diagram.
   const whiteboardStateRoot = path.dirname(stateFile);
 
@@ -246,7 +254,7 @@ export async function serve({
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
-        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+        finishFeedbackDelivery(key, immediate);
         res.json(immediate);
         return;
       }
@@ -280,7 +288,7 @@ export async function serve({
         responding = true;
         try {
           const result = await store.takeFeedback(key);
-          if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+          finishFeedbackDelivery(key, result);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
           } else {
@@ -337,9 +345,49 @@ export async function serve({
         await syncOutstandingRepairs(req.params.key);
         events.emit("layout-warnings", req.params.key, serializeLayoutWarnings(session.layout_warnings));
       }
+      events.emit("chat-sync", req.params.key, session.chat || []);
       events.emit(shouldEndSession ? "ended" : "feedback", req.params.key);
-      res.json({ status: "queued", pending_prompts: session.pending_prompts });
+      res.json({
+        status: "queued",
+        pending_prompts: session.pending_prompts,
+        chat: session.chat || [],
+        answered_questions: session.answered_questions || [],
+      });
       if (shouldEndSession) await shutdownIfNoLiveSessions();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/queued-prompts", async (req, res, next) => {
+    try {
+      const session = await store.saveQueuedPrompts(req.params.key, {
+        prompts: req.body?.prompts,
+        version: req.body?.version,
+      });
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      res.json({
+        status: "saved",
+        queued_prompts: session.queued_prompts || [],
+        queued_prompts_version: session.queued_prompts_version || 0,
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/answered-questions", async (req, res, next) => {
+    try {
+      const session = await store.setAnsweredQuestion(req.params.key, req.body?.question, req.body?.answered !== false);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      events.emit("chat-sync", req.params.key, session.chat || []);
+      res.json({ status: "saved", answered_questions: session.answered_questions || [] });
     } catch (error) {
       next(error);
     }
@@ -717,6 +765,11 @@ export async function serve({
           res.write(`event: layout-warnings\ndata: ${JSON.stringify({ warnings })}\n\n`);
         }
       };
+      const sendChatSync = (key, chat) => {
+        if (key === req.params.key) {
+          res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: chat || [] })}\n\n`);
+        }
+      };
       res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
       res.write(
         `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
@@ -725,12 +778,14 @@ export async function serve({
       events.on("agent-reply", sendAgentReply);
       events.on("agent-presence", sendPresence);
       events.on("layout-warnings", sendLayoutWarnings);
+      events.on("chat-sync", sendChatSync);
       req.on("close", () => {
         sseClients.delete(res);
         events.off("reload", sendReload);
         events.off("agent-reply", sendAgentReply);
         events.off("agent-presence", sendPresence);
         events.off("layout-warnings", sendLayoutWarnings);
+        events.off("chat-sync", sendChatSync);
         refreshIdleTimer();
       });
     } catch (error) {
@@ -1474,6 +1529,9 @@ export function createChromeHtml(
     key: session.key,
     file: session.file,
     initialChat: session.chat || [],
+    initialQueuedPrompts: session.queued_prompts || [],
+    initialQueuedPromptsVersion: session.queued_prompts_version || 0,
+    initialAnsweredQuestions: session.answered_questions || [],
     // Bootstrapping the inbox from the server is what makes it survive a browser refresh or a
     // reconnect: the chrome never owns warning state, it only renders it.
     initialLayoutWarnings: serializeLayoutWarnings(session.layout_warnings),

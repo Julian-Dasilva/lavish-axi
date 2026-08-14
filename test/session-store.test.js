@@ -63,6 +63,75 @@ test("queued prompts are returned with DOM snapshot context and then cleared", a
   }
 });
 
+test("unsent queued prompts persist across session reloads and reject stale draft writes", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const draft = {
+      uid: "1",
+      prompt: "Keep this answer",
+      selector: "form#plan",
+      tag: "choice",
+      text: "Pro",
+      _lavishQueueKey: "question:plan",
+      _lavishQuestionKey: "plan",
+    };
+
+    await store.saveQueuedPrompts(session.key, { prompts: [draft], version: 2 });
+    const reopened = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    assert.deepEqual(reopened.queued_prompts, [draft]);
+    assert.equal(reopened.queued_prompts_version, 2);
+
+    await store.saveQueuedPrompts(session.key, {
+      prompts: [{ ...draft, prompt: "Stale answer" }],
+      version: 1,
+    });
+    const current = await store.findByKey(session.key);
+    assert.equal(current.queued_prompts[0].prompt, "Keep this answer");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("accepted prompts are marked sent, delivered prompts are marked delivered, and answered questions persist", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, {
+      prompts: [{ uid: "", prompt: "Use Pro", selector: "form#plan", tag: "choice", text: "Pro" }],
+      answeredQuestions: ["plan"],
+    });
+
+    let accepted = await store.findByKey(session.key);
+    assert.equal(accepted.chat[0].state, "sent");
+    assert.deepEqual(accepted.answered_questions, ["plan"]);
+
+    const feedback = feedbackResult(await store.takeFeedback(session.key));
+    assert.deepEqual(feedback.prompts[0], {
+      uid: "",
+      prompt: "Use Pro",
+      selector: "form#plan",
+      tag: "choice",
+      text: "Pro",
+    });
+    const delivered = await store.findByKey(session.key);
+    assert.equal(delivered.chat[0].state, "delivered");
+    assert.deepEqual(delivered.answered_questions, ["plan"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("queued text selection prompts preserve range anchors", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
