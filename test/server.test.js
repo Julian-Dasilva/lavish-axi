@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -764,16 +765,6 @@ test("chrome shows agent working state when a previous poll has released", async
   assert.match(js, /agent-presence/);
   assert.match(js, /Working\.\.\./);
   assert.match(js, /spinner/);
-});
-
-test("chrome disables sending only while working or ended", async () => {
-  const js = await chromeClientSource();
-
-  assert.match(js, /let agentPresence = "waiting"/);
-  assert.match(js, /function updateSendState\(\)/);
-  assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
-  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
-  assert.doesNotMatch(js, /hasContent/);
 });
 
 test("sending with an empty composer nudges instead of blocking", async () => {
@@ -3524,11 +3515,50 @@ test("send-and-end prompt submissions wake active polls with ended attribution",
       assert.equal(feedback.session_ended, true);
       assert.equal(feedback.ended_by, "user");
       assert.equal(feedback.prompts.length, 1);
+      assert.equal(await presence.next(), "waiting");
 
       const ended = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
       const endedBody = await ended.json();
       assert.equal(endedBody.status, "ended");
       assert.equal(endedBody.ended_by, "user");
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ending an active poll without final feedback leaves presence waiting", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const keepAlive = path.join(dir, "keep-alive.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(keepAlive, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: keepAlive }),
+    });
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+      const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`).then((res) => res.json());
+      assert.equal(await presence.next(), "listening");
+
+      await fetch(`${base}/api/${key}/end`, { method: "POST" });
+      assert.equal((await poll).status, "ended");
+      assert.equal(await presence.next(), "waiting");
     } finally {
       await presence.close();
     }
@@ -3766,7 +3796,63 @@ test("heartbeat long-poll errors close the stream without Express error handling
   assert.match(source, /respond\(\)\.catch\(handleRespondError\)/);
 });
 
-test("SSE agent-presence switches to working when poll immediately takes queued feedback", async () => {
+test("a poll dropped before it arms never leaves presence listening", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    // Send a real poll request, then drop the socket while the handler is still inside its
+    // startup awaits - before it can register the long poll. A cleanup hook attached after
+    // that point never runs, so the poll would arm "listening" with nobody left to release it.
+    await new Promise((resolve, reject) => {
+      const socket = netConnect(server.port, "127.0.0.1", () => {
+        const target = `/api/poll?file=${encodeURIComponent(artifact)}`;
+        socket.write(`GET ${target} HTTP/1.1\r\nHost: 127.0.0.1:${server.port}\r\n\r\n`, () => {
+          socket.destroy();
+          resolve();
+        });
+      });
+      socket.on("error", reject);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+    } finally {
+      await presence.close();
+    }
+
+    // The abandoned poll also must not have consumed anything: a fresh poll still gets the
+    // feedback queued after it.
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: "still here", tag: "message" }] }),
+    });
+    const next = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    const feedback = await next.json();
+    assert.equal(feedback.status, "feedback");
+    assert.deepEqual(
+      feedback.prompts.map((prompt) => prompt.prompt),
+      ["still here"],
+    );
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("immediate poll delivery leaves presence working and preserves the next send", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await (await import("node:fs/promises")).writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3780,61 +3866,43 @@ test("SSE agent-presence switches to working when poll immediately takes queued 
     });
     const { key } = await open.json();
 
-    const presenceEvents = [];
-    const presenceWaiters = [];
-    const presenceController = new AbortController();
-    const presenceFetch = fetch(`${base}/events/${key}`, { signal: presenceController.signal }).then(async (res) => {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let lines;
-        while ((lines = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m))) {
-          const data = JSON.parse(lines[1]);
-          presenceEvents.push(data.state);
-          buffer = buffer.replace(lines[0], "");
-          const waiter = presenceWaiters.shift();
-          if (waiter) waiter(data.state);
-        }
-      }
-    });
-    presenceFetch.catch(() => {});
-
-    const waitForPresence = () =>
-      new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("timed out waiting for agent presence event")), 500);
-        if (presenceEvents.length > waitForPresence.lastIndex) {
-          waitForPresence.lastIndex++;
-          clearTimeout(timer);
-          resolve(presenceEvents[waitForPresence.lastIndex - 1]);
-          return;
-        }
-        presenceWaiters.push((state) => {
-          waitForPresence.lastIndex = presenceEvents.length;
-          clearTimeout(timer);
-          resolve(state);
-        });
-      });
-    waitForPresence.lastIndex = 0;
-
-    const initial = await waitForPresence();
+    const initialPresence = await startPresenceStream(base, key);
+    const initial = await initialPresence.next();
     assert.equal(initial, "waiting");
+    await initialPresence.close();
 
     await fetch(`${base}/api/${key}/prompts`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: base },
       body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
     });
-    await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+    const immediate = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+    assert.deepEqual(
+      (await immediate.json()).prompts.map((prompt) => prompt.prompt),
+      ["hello"],
+    );
 
-    const working = await waitForPresence();
-    assert.equal(working, "working");
+    const afterImmediatePresence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await afterImmediatePresence.next(), "working");
+    } finally {
+      await afterImmediatePresence.close();
+    }
 
-    presenceController.abort();
-    await presenceFetch.catch(() => {});
+    const submitted = await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: "follow-up", tag: "message" }] }),
+    });
+    assert.equal(submitted.status, 200);
+
+    const nextPoll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    const nextFeedback = await nextPoll.json();
+    assert.equal(nextFeedback.status, "feedback");
+    assert.deepEqual(
+      nextFeedback.prompts.map((prompt) => prompt.prompt),
+      ["follow-up"],
+    );
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -3864,7 +3932,6 @@ test("SSE agent-presence resets to waiting after ending and reopening a session"
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
       await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
-      assert.equal(await presence.next(), "working");
 
       await fetch(`${base}/api/${key}/end`, { method: "POST" });
       // The browser end above is user-initiated, so reopening requires the explicit opt-in.
@@ -3889,6 +3956,48 @@ test("SSE agent-presence resets to waiting after ending and reopening a session"
   }
 });
 
+test("immediate send-and-end delivery clears working presence without an active poll", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+
+      const submitted = await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({
+          endSession: true,
+          prompts: [{ prompt: "bye", tag: "message" }],
+        }),
+      });
+      assert.equal(submitted.status, 200);
+
+      const immediate = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      const feedback = await immediate.json();
+      assert.equal(feedback.status, "feedback");
+      assert.equal(feedback.session_ended, true);
+      assert.equal(await presence.next(), "working");
+      assert.equal(await presence.next(), "waiting");
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("SSE agent-presence returns to waiting after an agent reply", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
@@ -3906,17 +4015,19 @@ test("SSE agent-presence returns to waiting after an agent reply", async () => {
     try {
       assert.equal(await presence.next(), "waiting");
 
+      const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`).then((response) => response.json());
+      assert.equal(await presence.next(), "listening");
       await fetch(`${base}/api/${key}/prompts`, {
         method: "POST",
         headers: { "content-type": "application/json", origin: base },
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
-      // A poll that drains the feedback and releases leaves presence "working".
-      await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      await poll;
+      // An armed poll that drains the feedback and releases leaves presence "working".
       assert.equal(await presence.next(), "working");
 
-      // The reply concludes that work. Without a clear here, presence stays "working"
-      // forever (the chrome disables Send) until some future poll happens to attach.
+      // The reply concludes that work. Without a clear here, presence stays "working" forever
+      // even though the agent has answered.
       await fetch(`${base}/api/${key}/agent-reply`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -3932,7 +4043,7 @@ test("SSE agent-presence returns to waiting after an agent reply", async () => {
   }
 });
 
-test("SSE agent-presence stays working when resuming an open session", async () => {
+test("SSE agent-presence stays working when resuming after immediate feedback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
