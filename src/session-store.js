@@ -185,6 +185,7 @@ export class SessionStore {
     }
     const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
     const shouldEndSession = Boolean(payload.endSession || payload.end_session);
+    const restoring = options.restore === true;
     const alreadyEnded = session.status === "ended";
     const normalized = prompts.map(normalizePrompt);
     const normalizedPrompts = normalized.map((entry) => entry.prompt);
@@ -215,66 +216,103 @@ export class SessionStore {
     const revision = normalizeRevision(session.artifact_revision);
     const at = new Date().toISOString();
     let warnings = normalizeStoredWarnings(session.layout_warnings);
-    const layoutPlans = [];
-    const conflicts = new Set();
-    for (const prompt of normalizedPrompts) {
-      const warningIds = layoutWarningPromptIds(prompt);
-      if (warningIds === null) {
-        layoutPlans.push({
-          prompt,
-          warningIds: null,
-          expectedRevision: null,
-          conflicts: [],
-          queueIds: [],
-          hadKnownWarning: false,
-        });
-        continue;
+    let acceptedPrompts;
+    if (restoring) {
+      acceptedPrompts = normalizedPrompts;
+    } else {
+      const layoutPlans = [];
+      const conflicts = new Set();
+      for (const prompt of normalizedPrompts) {
+        const warningIds = layoutWarningPromptIds(prompt);
+        if (warningIds === null) {
+          layoutPlans.push({
+            prompt,
+            warningIds: null,
+            expectedRevision: null,
+            conflicts: [],
+            queueIds: [],
+            hadKnownWarning: false,
+          });
+          continue;
+        }
+        const plan = planLayoutWarningPrompt(warnings, prompt, revision);
+        for (const id of plan.conflicts) conflicts.add(id);
+        layoutPlans.push({ prompt, ...plan });
       }
-      const plan = planLayoutWarningPrompt(warnings, prompt, revision);
-      for (const id of plan.conflicts) conflicts.add(id);
-      layoutPlans.push({ prompt, ...plan });
-    }
-    if (conflicts.size > 0) {
-      return {
-        conflict: true,
-        session,
-        warning_ids: [...conflicts],
-        warnings: serializeLayoutWarnings(warnings),
-      };
-    }
-    const acceptedPrompts = [];
-    for (const plan of layoutPlans) {
-      if (plan.warningIds === null) {
-        acceptedPrompts.push(plan.prompt);
-        continue;
+      if (conflicts.size > 0) {
+        return {
+          conflict: true,
+          session,
+          warning_ids: [...conflicts],
+          warnings: serializeLayoutWarnings(warnings),
+        };
       }
-      const result = queueWarningRecords(warnings, plan.queueIds, { revision, at });
-      warnings = result.warnings;
-      if (result.queued.length > 0 || !plan.hadKnownWarning) acceptedPrompts.push(plan.prompt);
+      acceptedPrompts = [];
+      for (const plan of layoutPlans) {
+        if (plan.warningIds === null) {
+          acceptedPrompts.push(plan.prompt);
+          continue;
+        }
+        const result = queueWarningRecords(warnings, plan.queueIds, { revision, at });
+        warnings = result.warnings;
+        if (result.queued.length > 0 || !plan.hadKnownWarning) acceptedPrompts.push(plan.prompt);
+      }
     }
     session.layout_warnings = warnings;
-    const promptIds = acceptedPrompts.map(() => crypto.randomBytes(12).toString("base64url"));
-    const userMessages = acceptedPrompts.map((prompt, index) => ({
-      role: "user",
-      text: prompt.prompt || prompt.text || "Feedback",
-      state: "sent",
-      prompt_id: promptIds[index],
-      at: new Date().toISOString(),
-    }));
+    // A restore is a put-back of feedback a closed poll already took, not a new send:
+    // the chat records for these prompts are already in `session.chat`, so re-echoing
+    // them (and minting fresh prompt ids for them) would duplicate the conversation.
+    const promptIds = restoring ? [] : acceptedPrompts.map(() => crypto.randomBytes(12).toString("base64url"));
+    const userMessages = restoring
+      ? []
+      : acceptedPrompts.map((prompt, index) => ({
+          role: "user",
+          text: prompt.prompt || prompt.text || "Feedback",
+          state: "sent",
+          prompt_id: promptIds[index],
+          at: new Date().toISOString(),
+        }));
     session.prompts = [...(session.prompts || []), ...acceptedPrompts];
     session.pending_prompt_ids = [...(session.pending_prompt_ids || []), ...promptIds];
     session.chat = [...(session.chat || []), ...userMessages];
-    const answeredQuestions = normalizeQuestionKeys(payload.answeredQuestions || payload.answered_questions);
-    session.answered_questions = normalizeQuestionKeys([...(session.answered_questions || []), ...answeredQuestions]);
-    const submittedVersion = normalizeDraftVersion(payload.draftVersion || payload.queuedPromptsVersion);
-    const currentDraftVersion = normalizeDraftVersion(session.queued_prompts_version);
-    if (!submittedVersion || submittedVersion >= currentDraftVersion) {
-      session.queued_prompts = [];
-      if (submittedVersion > currentDraftVersion) session.queued_prompts_version = submittedVersion;
+    if (restoring) {
+      session.artifact_failures = Array.isArray(payload.artifact_failures)
+        ? JSON.parse(JSON.stringify(payload.artifact_failures))
+        : [];
+      // The take marked these chat records `delivered` and cleared their pending ids.
+      // The batch never reached the agent, so put both back - otherwise the conversation
+      // reports feedback as delivered while it is still waiting for the next poll.
+      const restoredPromptIds = Array.isArray(payload.delivered_prompt_ids)
+        ? payload.delivered_prompt_ids.map((id) => String(id || "")).filter(Boolean)
+        : [];
+      if (restoredPromptIds.length > 0) {
+        const restoredIds = new Set(restoredPromptIds);
+        session.pending_prompt_ids = [...(session.pending_prompt_ids || []), ...restoredPromptIds];
+        session.chat = (session.chat || []).map((item) =>
+          restoredIds.has(item.prompt_id) ? { ...item, state: "sent" } : item,
+        );
+      }
+    } else {
+      // Only a real send retires the browser's draft: a restore carries no draft
+      // version, so clearing here would wipe prompts the user queued after the send.
+      const answeredQuestions = normalizeQuestionKeys(payload.answeredQuestions || payload.answered_questions);
+      session.answered_questions = normalizeQuestionKeys([...(session.answered_questions || []), ...answeredQuestions]);
+      const submittedVersion = normalizeDraftVersion(payload.draftVersion || payload.queuedPromptsVersion);
+      const currentDraftVersion = normalizeDraftVersion(session.queued_prompts_version);
+      if (!submittedVersion || submittedVersion >= currentDraftVersion) {
+        session.queued_prompts = [];
+        if (submittedVersion > currentDraftVersion) session.queued_prompts_version = submittedVersion;
+      }
     }
     session.pending_prompts = session.prompts.length;
     session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
-    session.status = shouldEndSession || alreadyEnded ? "ended" : session.prompts.length > 0 ? "feedback" : "open";
+    session.status =
+      shouldEndSession || alreadyEnded
+        ? "ended"
+        : session.prompts.length > 0 ||
+            (restoring && Array.isArray(session.artifact_failures) && session.artifact_failures.length > 0)
+          ? "feedback"
+          : "open";
     if (shouldEndSession) session.ended_by = "user";
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
@@ -575,6 +613,10 @@ export class SessionStore {
         dom_snapshot: session.dom_snapshot || "",
         prompts,
         chat: [],
+        // Client-invisible, like `chat`: the poll route strips both before responding. A poll
+        // that closes mid-take needs these ids to put the `sent` chat state back (see
+        // `restoreClosedFeedback`), because the batch never actually reached the agent.
+        delivered_prompt_ids: /** @type {string[]} */ ([]),
         ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
         ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
       };
@@ -585,6 +627,7 @@ export class SessionStore {
         );
       }
       result.chat = session.chat || [];
+      result.delivered_prompt_ids = [...deliveredPromptIds];
       // Delivery clears pending prompts, so retain the attachment ids for a bounded
       // grace window while the polling agent opens the absolute paths it received.
       const deliveredNow = Date.now();

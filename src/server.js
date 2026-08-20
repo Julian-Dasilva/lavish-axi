@@ -253,12 +253,48 @@ export async function serve({
     if (result.status !== "feedback") return;
     const chat = result.chat;
     delete result.chat;
+    delete result.delivered_prompt_ids;
     markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
     // A batch flagged `session_ended` is the last one this session will ever deliver, so no
     // later poll or agent reply can retire the working state markFeedbackDelivered just set:
     // release it here or presence reports an agent still working on a session that is over.
     if (result.session_ended) clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
     if (Array.isArray(chat)) events.emit("chat-sync", key, chat);
+  }
+
+  async function restoreClosedFeedback(key, result) {
+    if (result.status !== "feedback") return;
+    const prompts = Array.isArray(result.prompts) ? result.prompts : [];
+    const session = await store.queuePrompts(
+      key,
+      {
+        dom_snapshot: result.dom_snapshot || "",
+        prompts,
+        ...(Array.isArray(result.delivered_prompt_ids) ? { delivered_prompt_ids: result.delivered_prompt_ids } : {}),
+        ...(Array.isArray(result.artifact_failures) ? { artifact_failures: result.artifact_failures } : {}),
+      },
+      {
+        restore: true,
+        resolveAttachment: (sessionKeyValue, id) => resolveAttachment(attachmentStateRoot, sessionKeyValue, id),
+        maxPerPrompt: attachmentConfig.maxPerPrompt,
+        maxPromptBytes: attachmentConfig.maxPromptBytes,
+      },
+    );
+    const restoredPrompts =
+      prompts.length === 0
+        ? []
+        : session && !session.rejected && !session.conflict && Array.isArray(session.prompts)
+          ? session.prompts.slice(-prompts.length)
+          : null;
+    const restoredFailures = session && Array.isArray(session.artifact_failures) ? session.artifact_failures : null;
+    if (
+      !restoredPrompts ||
+      JSON.stringify(restoredPrompts) !== JSON.stringify(prompts) ||
+      (Array.isArray(result.artifact_failures) &&
+        JSON.stringify(restoredFailures) !== JSON.stringify(result.artifact_failures))
+    ) {
+      writeLog("[lavish] closed poll feedback restore was incomplete; delivery was not marked");
+    }
   }
 
   // Whiteboard sidecar files live next to state.json, keyed by session + diagram.
@@ -407,6 +443,11 @@ export async function serve({
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
+        if (requestClosed || req.destroyed || res.writableEnded) {
+          await restoreClosedFeedback(key, immediate);
+          detachRequestClose();
+          return;
+        }
         finishFeedbackDelivery(key, immediate);
         detachRequestClose();
         res.json(immediate);
