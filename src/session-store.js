@@ -142,6 +142,11 @@ export class SessionStore {
     }
     const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
     const shouldEndSession = Boolean(payload.endSession || payload.end_session);
+    // `options.restore` re-queues a batch `takeFeedback` already removed (a poll whose client
+    // disconnected before its response was written). Those prompts were accepted once already, so
+    // restoring replays them verbatim: no layout-warning plan or conflict check to re-run, no chat
+    // messages to re-append, and `artifact_failures` is reinstated rather than merged. Attachments
+    // are still re-derived through the resolver, because restore re-enters the same trust boundary.
     const restoring = options.restore === true;
     const alreadyEnded = session.status === "ended";
     const normalized = prompts.map(normalizePrompt);

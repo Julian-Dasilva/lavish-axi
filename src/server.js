@@ -269,6 +269,11 @@ export async function serve({
     if (Array.isArray(chat)) events.emit("chat-sync", key, chat);
   }
 
+  // `takeFeedback` is destructive: it clears the batch from `state.json` before anything is
+  // written to the response. A client that disconnected while that take was in flight would
+  // otherwise lose the feedback for good, so put it back verbatim through the store's `restore`
+  // mode and leave delivery unmarked - nothing reached an agent. A restore that comes back short
+  // is logged, so a batch that could not be put back whole is visible instead of silently gone.
   async function restoreClosedFeedback(key, result) {
     if (result.status !== "feedback") return;
     const prompts = Array.isArray(result.prompts) ? result.prompts : [];
