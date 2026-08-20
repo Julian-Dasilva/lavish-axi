@@ -382,8 +382,8 @@ export function startPollWaitReporter({
  *   session: { file: string, status: string, session_ended?: boolean, ended_by?: string },
  *   prompts?: any[],
  *   artifact_failures?: any[],
- *   dom_snapshot?: string,
  *   next_step?: string,
+ *   dom_snapshot?: string,
  * }}
  */
 export function createPollOutput({ file, response, agent = "generic" }) {
@@ -404,8 +404,8 @@ export function createPollOutput({ file, response, agent = "generic" }) {
       },
       prompts: response.prompts || [],
       ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
-      dom_snapshot: response.dom_snapshot || "",
       next_step: createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, response.prompts || [], agent),
+      dom_snapshot: response.dom_snapshot || "",
     };
   }
   if (response.status === "ended") {
