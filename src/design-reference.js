@@ -65,6 +65,9 @@ export const MERMAID_CDN_SNIPPET = `<script type="module">
     return darkQuery.matches;
   }
 
+  // Capture and restore with innerHTML, not textContent: Mermaid treats <br/> inside a
+  // quoted label as a line break, and a textContent round-trip would drop it and fuse
+  // the label onto one line. Rendering stays safe through securityLevel: "strict" below.
   const diagrams = [...document.querySelectorAll(".mermaid")].map((el) => ({ el, src: el.innerHTML }));
   let applied;
   let rendering = false;
