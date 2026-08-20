@@ -29,7 +29,7 @@ import {
   resolveWatchTarget,
   serve,
 } from "../src/server.js";
-import { canonicalFile, sessionKey } from "../src/session-store.js";
+import { canonicalFile, sessionKey, SessionStore } from "../src/session-store.js";
 
 async function chromeClientSource() {
   return readFile(new URL("../src/chrome-client.js", import.meta.url), "utf8");
@@ -3858,6 +3858,98 @@ test("immediate poll delivery leaves presence working and preserves the next sen
       ["follow-up"],
     );
   } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a disconnect during immediate feedback take requeues the batch without working presence", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
+  const originalTakeFeedback = SessionStore.prototype.takeFeedback;
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const queued = {
+      domSnapshot: 'uid=1 body "review"',
+      prompts: [
+        {
+          uid: "choice-1",
+          prompt: "Use the compact layout",
+          selector: "#compact",
+          tag: "choice",
+          text: "Compact",
+          target: { type: "text-range", text: "Compact", commonAncestorSelector: "#options" },
+        },
+        { uid: "message-1", prompt: "Looks good", selector: "body", tag: "message", text: "" },
+      ],
+    };
+    const submitted = await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify(queued),
+    });
+    assert.equal(submitted.status, 200);
+    const beforeState = JSON.parse(await readFile(stateFile, "utf8")).sessions[key];
+    const before = beforeState.prompts;
+
+    /** @type {() => void} */
+    let releaseTake = () => {};
+    const takeReleased = new Promise((resolve) => {
+      releaseTake = () => resolve();
+    });
+    let takeStarted;
+    const takePending = new Promise((resolve) => {
+      takeStarted = resolve;
+    });
+    let delayed = true;
+    SessionStore.prototype.takeFeedback = async function (sessionKey) {
+      if (delayed && sessionKey === key) {
+        delayed = false;
+        takeStarted();
+        await takeReleased;
+      }
+      return originalTakeFeedback.call(this, sessionKey);
+    };
+
+    const socket = await new Promise((resolve, reject) => {
+      const client = netConnect(server.port, "127.0.0.1", () => {
+        client.write(
+          `GET /api/poll?file=${encodeURIComponent(artifact)} HTTP/1.1\r\nHost: 127.0.0.1:${server.port}\r\n\r\n`,
+          () => resolve(client),
+        );
+      });
+      client.on("error", reject);
+    });
+    await takePending;
+    socket.on("error", () => {});
+    socket.destroy();
+    releaseTake();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+    } finally {
+      await presence.close();
+    }
+
+    const next = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    const feedback = await next.json();
+    assert.equal(feedback.status, "feedback");
+    assert.deepEqual(feedback.dom_snapshot, queued.domSnapshot);
+    assert.deepEqual(feedback.prompts, before);
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).sessions[key].chat, beforeState.chat);
+  } finally {
+    SessionStore.prototype.takeFeedback = originalTakeFeedback;
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
