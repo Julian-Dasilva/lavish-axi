@@ -163,6 +163,11 @@ export class SessionStore {
     });
   }
 
+  // `options.restore === true` marks a put-back of a batch `takeFeedback` already
+  // removed (a poll that closed mid-delivery), not a new send from the reviewer, so
+  // it skips layout-warning planning and the chat echo. See AGENTS.md, request flow
+  // step 8, for why each of those has to be skipped.
+  //
   // `options.resolveAttachment(key, id) => Promise<metadata|null>` is the trust
   // boundary for image attachments: a prompt only ever carries the client's
   // claimed `id` (and display `name`); every authoritative field (absolute path,
