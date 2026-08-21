@@ -235,9 +235,7 @@ export class SessionStore {
         ? JSON.parse(JSON.stringify(payload.artifact_failures))
         : [];
       const existingFailures = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
-      session.artifact_failures = mergeArtifactFailures(restoredFailures, existingFailures, {
-        retain: "earlier",
-      }).failures;
+      session.artifact_failures = mergeArtifactFailures(restoredFailures, existingFailures).failures;
     }
     session.pending_prompts = session.prompts.length;
     const restoredSnapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
@@ -872,18 +870,19 @@ function parsePassSequence(payload) {
 
 const ARTIFACT_FAILURE_KINDS = new Set(["artifact-unavailable", "artifact-asset-unavailable"]);
 
-// The single merge policy for `session.artifact_failures`, shared by the two writers that add to
-// it (a fresh report and a closed-poll restore). Both need the same two properties: a repeat of a
-// failure already on file is not a second failure, and the list stays bounded because state.json
-// is rewritten wholesale. `earlier` keeps chronological order.
+// The single merge policy for `session.artifact_failures`, shared by both writers that add to it
+// (a fresh report and a closed-poll restore), which is why `earlier` is always the chronologically
+// older side. A repeat of a failure already on file is not a second failure, and the list stays
+// bounded because state.json is rewritten wholesale.
 //
-// Which END the bound trims is the one thing the two writers need differently, and it is
-// load-bearing. A fresh report keeps the NEWEST, because the newest observations describe the
-// artifact the reviewer is looking at now. A restore must keep its OWN entries (`retain: "earlier"`),
-// because those are the batch a poll already took and failed to deliver: trimming the newest end
-// would let a disconnect window that recorded distinct new failures discard the whole restored set,
-// which is exactly the loss restore exists to prevent.
-function mergeArtifactFailures(earlier, later, options = {}) {
+// Which END the bound trims is one policy for both writers, and it is load-bearing that a restore
+// does not get its own: the bound keeps the NEWEST entries, so no write can evict an observation
+// made after it. A restore that trimmed the newest end instead would delete failures recorded
+// inside its own disconnect window - never delivered either, and describing the artifact the
+// reviewer is looking at now - and nothing else holds them, because the restore REPLACES this list.
+// At the bound the restore's own overflow is dropped, which `restoreClosedFeedback` reports through
+// its incomplete-restore log rather than losing silently.
+function mergeArtifactFailures(earlier, later) {
   const merged = Array.isArray(earlier) ? [...earlier] : [];
   let changed = false;
   for (const failure of Array.isArray(later) ? later : []) {
@@ -891,9 +890,7 @@ function mergeArtifactFailures(earlier, later, options = {}) {
     merged.push(failure);
     changed = true;
   }
-  const failures =
-    options.retain === "earlier" ? merged.slice(0, MAX_ARTIFACT_FAILURES) : merged.slice(-MAX_ARTIFACT_FAILURES);
-  return { failures, changed };
+  return { failures: merged.slice(-MAX_ARTIFACT_FAILURES), changed };
 }
 
 function normalizeArtifactFailures(failures) {

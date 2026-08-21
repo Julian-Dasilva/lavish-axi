@@ -1523,37 +1523,68 @@ test("restoring artifact failures dedupes against one re-reported in the disconn
   });
 });
 
-test("a restore cannot push artifact failures past their retention bound", async () => {
-  await withStore(async ({ store, session }) => {
-    const load = await beginArtifactLoad(store, session.key);
-    const failures = (offset) =>
-      Array.from({ length: 20 }, (_, i) => ({
-        kind: "artifact-asset-unavailable",
-        detail: `asset-${offset + i}.css`,
-      }));
-    await store.recordArtifactFailures(session.key, { ...diagnosticPayload(load, 1), failures: failures(0) });
-    const taken = feedbackResult(await store.takeFeedback(session.key));
-    assert.equal(taken.artifact_failures?.length, 20);
+// Which entries survive the bound is the policy, not the count. The restore REPLACES
+// session.artifact_failures, so anything its merge trims is gone from the store: a restore
+// that trimmed the newest end would delete the failures recorded inside its own disconnect
+// window, which have never been delivered either and describe the current artifact. The bound
+// therefore keeps the newest entries for both writers, and the restore's own overflow - the
+// only loss the bound can still cause - is what restoreClosedFeedback reports as incomplete.
+const restoreRetentionCases = [
+  {
+    name: "keeps every failure recorded during the disconnect window",
+    windowCount: 5,
+    // 20 restored + 5 window = 25 over a bound of 20: the five oldest restored entries go.
+    expected: [...range(5, 20).map((i) => `asset-${i}.css`), ...range(0, 5).map((i) => `asset-${100 + i}.css`)],
+  },
+  {
+    name: "never evicts a window failure to make room for a restored one",
+    windowCount: 20,
+    expected: range(0, 20).map((i) => `asset-${100 + i}.css`),
+  },
+];
 
-    await store.recordArtifactFailures(session.key, { ...diagnosticPayload(load, 2), failures: failures(100) });
-    const restored = await store.queuePrompts(
-      session.key,
-      { dom_snapshot: "", prompts: [], artifact_failures: taken.artifact_failures },
-      { restore: true },
-    );
-    assert.equal(restored.artifact_failures.length, 20, "the merged list stays bounded");
-    // Which entries survive the bound is the policy, not the count. The restored batch was
-    // already taken from the store and never reached the agent, so it is what the restore
-    // exists to preserve; the failures recorded inside the disconnect window are still on
-    // file and reach the next poll on their own. Trimming the newest end is what keeps the
-    // restore from being a no-op that silently discards the batch it was putting back.
-    assert.deepEqual(
-      restored.artifact_failures.map((failure) => failure.detail),
-      failures(0).map((failure) => failure.detail),
-      "the never-delivered restored failures survive the bound",
-    );
+for (const testCase of restoreRetentionCases) {
+  test(`a restore bounded at the artifact-failure retention limit ${testCase.name}`, async () => {
+    await withStore(async ({ store, session }) => {
+      const load = await beginArtifactLoad(store, session.key);
+      const failures = (offset, count) =>
+        range(0, count).map((i) => ({
+          kind: "artifact-asset-unavailable",
+          detail: `asset-${offset + i}.css`,
+        }));
+      await store.recordArtifactFailures(session.key, { ...diagnosticPayload(load, 1), failures: failures(0, 20) });
+      const taken = feedbackResult(await store.takeFeedback(session.key));
+      assert.equal(taken.artifact_failures?.length, 20);
+
+      await store.recordArtifactFailures(session.key, {
+        ...diagnosticPayload(load, 2),
+        failures: failures(100, testCase.windowCount),
+      });
+      const restored = await store.queuePrompts(
+        session.key,
+        { dom_snapshot: "", prompts: [], artifact_failures: taken.artifact_failures },
+        { restore: true },
+      );
+      assert.equal(restored.artifact_failures.length, 20, "the merged list stays bounded");
+      assert.deepEqual(
+        restored.artifact_failures.map((failure) => failure.detail),
+        testCase.expected,
+      );
+
+      // The store is the only place these live, so what the next poll delivers is the proof.
+      const delivered = feedbackResult(await store.takeFeedback(session.key));
+      assert.deepEqual(
+        delivered.artifact_failures.map((failure) => failure.detail),
+        testCase.expected,
+        "the surviving failures are the ones the agent is handed",
+      );
+    });
   });
-});
+}
+
+function range(start, end) {
+  return Array.from({ length: end - start }, (_, i) => start + i);
+}
 
 // A well-formed but nonexistent content-hash id, distinct per index.
 function unknownAttachmentId(index) {
