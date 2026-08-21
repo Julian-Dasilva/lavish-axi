@@ -1542,6 +1542,16 @@ test("a restore cannot push artifact failures past their retention bound", async
       { restore: true },
     );
     assert.equal(restored.artifact_failures.length, 20, "the merged list stays bounded");
+    // Which entries survive the bound is the policy, not the count. The restored batch was
+    // already taken from the store and never reached the agent, so it is what the restore
+    // exists to preserve; the failures recorded inside the disconnect window are still on
+    // file and reach the next poll on their own. Trimming the newest end is what keeps the
+    // restore from being a no-op that silently discards the batch it was putting back.
+    assert.deepEqual(
+      restored.artifact_failures.map((failure) => failure.detail),
+      failures(0).map((failure) => failure.detail),
+      "the never-delivered restored failures survive the bound",
+    );
   });
 });
 

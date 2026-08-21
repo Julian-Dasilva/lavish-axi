@@ -235,7 +235,9 @@ export class SessionStore {
         ? JSON.parse(JSON.stringify(payload.artifact_failures))
         : [];
       const existingFailures = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
-      session.artifact_failures = mergeArtifactFailures(restoredFailures, existingFailures).failures;
+      session.artifact_failures = mergeArtifactFailures(restoredFailures, existingFailures, {
+        retain: "earlier",
+      }).failures;
     }
     session.pending_prompts = session.prompts.length;
     const restoredSnapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
@@ -873,8 +875,15 @@ const ARTIFACT_FAILURE_KINDS = new Set(["artifact-unavailable", "artifact-asset-
 // The single merge policy for `session.artifact_failures`, shared by the two writers that add to
 // it (a fresh report and a closed-poll restore). Both need the same two properties: a repeat of a
 // failure already on file is not a second failure, and the list stays bounded because state.json
-// is rewritten wholesale. `earlier` keeps chronological order, and the bound keeps the newest.
-function mergeArtifactFailures(earlier, later) {
+// is rewritten wholesale. `earlier` keeps chronological order.
+//
+// Which END the bound trims is the one thing the two writers need differently, and it is
+// load-bearing. A fresh report keeps the NEWEST, because the newest observations describe the
+// artifact the reviewer is looking at now. A restore must keep its OWN entries (`retain: "earlier"`),
+// because those are the batch a poll already took and failed to deliver: trimming the newest end
+// would let a disconnect window that recorded distinct new failures discard the whole restored set,
+// which is exactly the loss restore exists to prevent.
+function mergeArtifactFailures(earlier, later, options = {}) {
   const merged = Array.isArray(earlier) ? [...earlier] : [];
   let changed = false;
   for (const failure of Array.isArray(later) ? later : []) {
@@ -882,7 +891,9 @@ function mergeArtifactFailures(earlier, later) {
     merged.push(failure);
     changed = true;
   }
-  return { failures: merged.slice(-MAX_ARTIFACT_FAILURES), changed };
+  const failures =
+    options.retain === "earlier" ? merged.slice(0, MAX_ARTIFACT_FAILURES) : merged.slice(-MAX_ARTIFACT_FAILURES);
+  return { failures, changed };
 }
 
 function normalizeArtifactFailures(failures) {
