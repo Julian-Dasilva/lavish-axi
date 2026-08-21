@@ -511,6 +511,10 @@ export async function serve({
         responding = true;
         try {
           const result = await store.takeFeedback(key);
+          if (requestClosed || req.destroyed || res.writableEnded) {
+            await restoreClosedFeedback(key, result);
+            return;
+          }
           finishFeedbackDelivery(key, result);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
