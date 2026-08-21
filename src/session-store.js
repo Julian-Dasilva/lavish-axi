@@ -144,9 +144,10 @@ export class SessionStore {
     const shouldEndSession = Boolean(payload.endSession || payload.end_session);
     // `options.restore` re-queues a batch `takeFeedback` already removed (a poll whose client
     // disconnected before its response was written). Those prompts were accepted once already, so
-    // restoring replays them verbatim: no layout-warning plan or conflict check to re-run, no chat
-    // messages to re-append, and `artifact_failures` is reinstated rather than merged. Attachments
-    // are still re-derived through the resolver, because restore re-enters the same trust boundary.
+    // restoring replays them verbatim: no layout-warning plan or conflict check to re-run and no
+    // chat messages to re-append. Restored prompts are prepended to newer prompts, while newer
+    // snapshots and failures are preserved. Attachments are still re-derived through the resolver,
+    // because restore re-enters the same trust boundary.
     const restoring = options.restore === true;
     const alreadyEnded = session.status === "ended";
     const normalized = prompts.map(normalizePrompt);
@@ -226,15 +227,21 @@ export class SessionStore {
       : acceptedPrompts
           .filter((prompt) => prompt.tag === "message" && prompt.prompt)
           .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
-    session.prompts = [...(session.prompts || []), ...acceptedPrompts];
+    const existingPrompts = Array.isArray(session.prompts) ? session.prompts : [];
+    session.prompts = restoring ? [...acceptedPrompts, ...existingPrompts] : [...existingPrompts, ...acceptedPrompts];
     session.chat = [...(session.chat || []), ...userMessages];
     if (restoring) {
-      session.artifact_failures = Array.isArray(payload.artifact_failures)
+      const restoredFailures = Array.isArray(payload.artifact_failures)
         ? JSON.parse(JSON.stringify(payload.artifact_failures))
         : [];
+      const existingFailures = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
+      session.artifact_failures = [...restoredFailures, ...existingFailures];
     }
     session.pending_prompts = session.prompts.length;
-    session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
+    const restoredSnapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
+    if (!restoring || (existingPrompts.length === 0 && !session.dom_snapshot)) {
+      session.dom_snapshot = restoredSnapshot;
+    }
     session.status =
       shouldEndSession || alreadyEnded
         ? "ended"

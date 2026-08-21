@@ -1393,6 +1393,58 @@ test("queuePrompts and takeFeedback serialize so a mid-resolution poll never clo
   }
 });
 
+test("restoring a taken batch preserves newer prompts, snapshot, chat, and artifact failures", async () => {
+  await withStore(async ({ store, session }) => {
+    const first = { uid: "A", prompt: "First", selector: "", tag: "message", text: "" };
+    const second = { uid: "B", prompt: "Second", selector: "", tag: "message", text: "" };
+    await store.queuePrompts(session.key, { domSnapshot: "FIRST snapshot", prompts: [first] });
+    const taken = feedbackResult(await store.takeFeedback(session.key));
+
+    await store.queuePrompts(session.key, { domSnapshot: "SECOND snapshot", prompts: [second] });
+    const load = await beginArtifactLoad(store, session.key);
+    const failure = { kind: "artifact-asset-unavailable", detail: "newer asset" };
+    const recorded = await store.recordArtifactFailures(session.key, {
+      ...diagnosticPayload(load, 1),
+      failures: [failure],
+    });
+    assert.equal(recorded.changed, true);
+
+    const restored = await store.queuePrompts(
+      session.key,
+      {
+        dom_snapshot: taken.dom_snapshot,
+        prompts: taken.prompts,
+        artifact_failures: taken.artifact_failures,
+      },
+      { restore: true },
+    );
+    assert.deepEqual(
+      restored.prompts.map((prompt) => prompt.uid),
+      ["A", "B"],
+    );
+    assert.equal(restored.dom_snapshot, "SECOND snapshot");
+    assert.deepEqual(
+      restored.chat.map((message) => message.text),
+      ["First", "Second"],
+    );
+    assert.deepEqual(
+      restored.artifact_failures.map((item) => item.detail),
+      ["newer asset"],
+    );
+
+    const feedback = feedbackResult(await store.takeFeedback(session.key));
+    assert.deepEqual(
+      feedback.prompts.map((prompt) => prompt.uid),
+      ["A", "B"],
+    );
+    assert.equal(feedback.dom_snapshot, "SECOND snapshot");
+    assert.deepEqual(
+      feedback.artifact_failures.map((item) => item.detail),
+      ["newer asset"],
+    );
+  });
+});
+
 // A well-formed but nonexistent content-hash id, distinct per index.
 function unknownAttachmentId(index) {
   return String(index).padStart(64, "0") + ".png";

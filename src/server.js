@@ -313,19 +313,20 @@ export async function serve({
       prompts.length === 0
         ? []
         : session && !session.rejected && !session.conflict && Array.isArray(session.prompts)
-          ? session.prompts.slice(-prompts.length)
+          ? session.prompts.slice(0, prompts.length)
           : null;
     const restoredFailures = session && Array.isArray(session.artifact_failures) ? session.artifact_failures : null;
+    const failuresRestored =
+      !Array.isArray(result.artifact_failures) ||
+      (Array.isArray(restoredFailures) &&
+        result.artifact_failures.every((failure) =>
+          restoredFailures.some((restoredFailure) => JSON.stringify(restoredFailure) === JSON.stringify(failure)),
+        ));
     if (restoreError) {
       writeLog(
         `[lavish] closed poll feedback restore failed; the batch was lost: ${restoreError?.message || restoreError}`,
       );
-    } else if (
-      !restoredPrompts ||
-      JSON.stringify(restoredPrompts) !== JSON.stringify(prompts) ||
-      (Array.isArray(result.artifact_failures) &&
-        JSON.stringify(restoredFailures) !== JSON.stringify(result.artifact_failures))
-    ) {
+    } else if (!restoredPrompts || JSON.stringify(restoredPrompts) !== JSON.stringify(prompts) || !failuresRestored) {
       writeLog("[lavish] closed poll feedback restore was incomplete; delivery was not marked");
     }
     const pendingAfterRestore =
