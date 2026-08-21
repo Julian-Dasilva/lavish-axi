@@ -1445,6 +1445,106 @@ test("restoring a taken batch preserves newer prompts, snapshot, chat, and artif
   });
 });
 
+test("restoring a delivery larger than one request's attachment bound loses nothing", async () => {
+  await withStore(async ({ store, session }) => {
+    const resolveAttachment = async (_key, attachmentId) => ({
+      id: attachmentId,
+      type: "image",
+      path: "/tmp/" + attachmentId,
+      mime: "image/png",
+      bytes: 10,
+      width: 1,
+      height: 1,
+    });
+    const opts = { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 };
+    const batch = (offset) =>
+      Array.from({ length: MAX_REQUEST_ATTACHMENT_REFS / 4 }, (_, i) => ({
+        uid: `${offset}-${i}`,
+        prompt: "p",
+        selector: "h1",
+        tag: "h1",
+        text: "",
+        attachments: Array.from({ length: 4 }, (_, j) => ({ id: unknownAttachmentId(offset + i * 4 + j) })),
+      }));
+    // Two accepted POSTs, each exactly at the per-request bound, drained by one poll.
+    await store.queuePrompts(session.key, { prompts: batch(1000) }, opts);
+    await store.queuePrompts(session.key, { prompts: batch(2000) }, opts);
+    const taken = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(taken.prompts.length, MAX_REQUEST_ATTACHMENT_REFS / 2);
+
+    // That delivery carries twice what one request may queue. Measuring the restore
+    // against the per-request bound would reject the whole batch and lose it for good.
+    const restored = await store.queuePrompts(
+      session.key,
+      { dom_snapshot: taken.dom_snapshot, prompts: taken.prompts },
+      { ...opts, restore: true },
+    );
+    assert.equal(restored.rejected, undefined, "the restore was not refused");
+    assert.deepEqual(
+      restored.prompts.map((prompt) => prompt.uid),
+      taken.prompts.map((prompt) => prompt.uid),
+    );
+
+    const feedback = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(
+      feedback.prompts.flatMap((prompt) => prompt.attachments || []).length,
+      MAX_REQUEST_ATTACHMENT_REFS * 2,
+      "every attachment survived the restore",
+    );
+  });
+});
+
+test("restoring artifact failures dedupes against one re-reported in the disconnect window", async () => {
+  await withStore(async ({ store, session }) => {
+    const load = await beginArtifactLoad(store, session.key);
+    const failure = { kind: "artifact-asset-unavailable", detail: "missing.css" };
+    await store.recordArtifactFailures(session.key, { ...diagnosticPayload(load, 1), failures: [failure] });
+    const taken = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(taken.artifact_failures?.length, 1);
+
+    // The take cleared the list, so the SDK's re-report for the still-current load
+    // records the identical failure again before the restore puts the taken one back.
+    const recorded = await store.recordArtifactFailures(session.key, {
+      ...diagnosticPayload(load, 2),
+      failures: [failure],
+    });
+    assert.equal(recorded.changed, true);
+
+    const restored = await store.queuePrompts(
+      session.key,
+      { dom_snapshot: "", prompts: [], artifact_failures: taken.artifact_failures },
+      { restore: true },
+    );
+    assert.deepEqual(
+      restored.artifact_failures.map((item) => item.detail),
+      ["missing.css"],
+      "the same failure is not handed to the agent twice",
+    );
+  });
+});
+
+test("a restore cannot push artifact failures past their retention bound", async () => {
+  await withStore(async ({ store, session }) => {
+    const load = await beginArtifactLoad(store, session.key);
+    const failures = (offset) =>
+      Array.from({ length: 20 }, (_, i) => ({
+        kind: "artifact-asset-unavailable",
+        detail: `asset-${offset + i}.css`,
+      }));
+    await store.recordArtifactFailures(session.key, { ...diagnosticPayload(load, 1), failures: failures(0) });
+    const taken = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(taken.artifact_failures?.length, 20);
+
+    await store.recordArtifactFailures(session.key, { ...diagnosticPayload(load, 2), failures: failures(100) });
+    const restored = await store.queuePrompts(
+      session.key,
+      { dom_snapshot: "", prompts: [], artifact_failures: taken.artifact_failures },
+      { restore: true },
+    );
+    assert.equal(restored.artifact_failures.length, 20, "the merged list stays bounded");
+  });
+});
+
 // A well-formed but nonexistent content-hash id, distinct per index.
 function unknownAttachmentId(index) {
   return String(index).padStart(64, "0") + ".png";

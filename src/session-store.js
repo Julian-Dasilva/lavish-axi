@@ -235,7 +235,7 @@ export class SessionStore {
         ? JSON.parse(JSON.stringify(payload.artifact_failures))
         : [];
       const existingFailures = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
-      session.artifact_failures = [...restoredFailures, ...existingFailures];
+      session.artifact_failures = mergeArtifactFailures(restoredFailures, existingFailures).failures;
     }
     session.pending_prompts = session.prompts.length;
     const restoredSnapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
@@ -487,17 +487,11 @@ export class SessionStore {
       }
       const normalized = normalizeArtifactFailures(payload?.failures);
       const previous = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
-      const merged = [...previous];
-      let changed = false;
-      for (const failure of normalized) {
-        if (merged.some((item) => item.kind === failure.kind && item.detail === failure.detail)) continue;
-        merged.push(failure);
-        changed = true;
-      }
+      const { failures, changed } = mergeArtifactFailures(previous, normalized);
       if (!changed) {
         return { session, changed: false };
       }
-      session.artifact_failures = merged.slice(-MAX_ARTIFACT_FAILURES);
+      session.artifact_failures = failures;
       if (session.status !== "ended") session.status = "feedback";
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
@@ -771,10 +765,17 @@ function boundAttachmentRefs(normalized, options) {
   }
   if (rejected.length) return rejected;
 
-  let requestRefs = 0;
-  for (const { prompt } of normalized) requestRefs += prompt.attachments?.length || 0;
-  if (requestRefs > MAX_REQUEST_ATTACHMENT_REFS) {
-    return [{ id: "", name: "", reason: "too-many-in-request" }];
+  // The request-wide bound guards ONE untrusted POST. A restore is not a request: it re-queues a
+  // batch this store already accepted across an unbounded number of earlier POSTs, so measuring it
+  // against a single request's budget rejects the whole batch and loses feedback for good - the
+  // exact loss restore exists to prevent. The per-prompt cap above and the resolver's own work
+  // still apply, and the ref count is bounded by what was already admitted.
+  if (options.restore !== true) {
+    let requestRefs = 0;
+    for (const { prompt } of normalized) requestRefs += prompt.attachments?.length || 0;
+    if (requestRefs > MAX_REQUEST_ATTACHMENT_REFS) {
+      return [{ id: "", name: "", reason: "too-many-in-request" }];
+    }
   }
   return rejected;
 }
@@ -868,6 +869,21 @@ function parsePassSequence(payload) {
 }
 
 const ARTIFACT_FAILURE_KINDS = new Set(["artifact-unavailable", "artifact-asset-unavailable"]);
+
+// The single merge policy for `session.artifact_failures`, shared by the two writers that add to
+// it (a fresh report and a closed-poll restore). Both need the same two properties: a repeat of a
+// failure already on file is not a second failure, and the list stays bounded because state.json
+// is rewritten wholesale. `earlier` keeps chronological order, and the bound keeps the newest.
+function mergeArtifactFailures(earlier, later) {
+  const merged = Array.isArray(earlier) ? [...earlier] : [];
+  let changed = false;
+  for (const failure of Array.isArray(later) ? later : []) {
+    if (merged.some((item) => item.kind === failure.kind && item.detail === failure.detail)) continue;
+    merged.push(failure);
+    changed = true;
+  }
+  return { failures: merged.slice(-MAX_ARTIFACT_FAILURES), changed };
+}
 
 function normalizeArtifactFailures(failures) {
   if (!Array.isArray(failures)) return [];

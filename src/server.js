@@ -322,10 +322,13 @@ export async function serve({
         result.artifact_failures.every((failure) =>
           restoredFailures.some((restoredFailure) => JSON.stringify(restoredFailure) === JSON.stringify(failure)),
         ));
+    const persistedNothing = !session || Boolean(session.rejected) || Boolean(session.conflict);
     if (restoreError) {
       writeLog(
         `[lavish] closed poll feedback restore failed; the batch was lost: ${restoreError?.message || restoreError}`,
       );
+    } else if (persistedNothing) {
+      writeLog("[lavish] closed poll feedback restore was refused; nothing was persisted and the batch was lost");
     } else if (!restoredPrompts || JSON.stringify(restoredPrompts) !== JSON.stringify(prompts) || !failuresRestored) {
       writeLog("[lavish] closed poll feedback restore was incomplete; delivery was not marked");
     }
