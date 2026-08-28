@@ -5028,6 +5028,49 @@ test("overlapping poll cleanup preserves working presence after one poll deliver
   }
 });
 
+test("a fresh poll attaching alone retires the previous round's working presence", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
+    });
+    const delivered = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal((await delivered.json()).status, "feedback");
+
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "working");
+
+      // The agent came back and attached with no other poll in flight: that starts a new round,
+      // so the poll ending without feedback has to leave presence waiting - not stuck on
+      // "working", which hides the "your agent is not listening" banner while nothing is attached.
+      const next = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=1`);
+      assert.deepEqual(await next.json(), { status: "waiting" });
+
+      assert.equal(await presence.next(), "listening");
+      assert.equal(await presence.next(), "waiting");
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a disconnect during immediate feedback take requeues the batch without working presence", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
