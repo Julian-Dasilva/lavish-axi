@@ -4956,10 +4956,11 @@ test("overlapping poll cleanup preserves working presence after one poll deliver
   const server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
   const originalTakeFeedback = SessionStore.prototype.takeFeedback;
   let takeCount = 0;
+  /** @type {(() => void) | null} */
   let takeCountWaiter = null;
   let releaseSecondResponse = () => {};
   const secondResponseReleased = new Promise((resolve) => {
-    releaseSecondResponse = resolve;
+    releaseSecondResponse = () => resolve();
   });
   try {
     const base = `http://127.0.0.1:${server.port}`;
@@ -4982,7 +4983,7 @@ test("overlapping poll cleanup preserves working presence after one poll deliver
     const waitForTakeCount = async (expected) => {
       while (takeCount < expected) {
         await new Promise((resolve) => {
-          takeCountWaiter = resolve;
+          takeCountWaiter = () => resolve();
         });
       }
     };

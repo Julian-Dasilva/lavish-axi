@@ -2125,7 +2125,6 @@ function setPollActive(key, activePolls, deliveredFeedback, events, active) {
     activePolls.delete(key);
   } else {
     activePolls.set(key, nextCount);
-    deliveredFeedback.delete(key);
   }
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) events.emit("agent-presence", key, nextPresence);
