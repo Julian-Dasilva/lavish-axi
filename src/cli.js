@@ -1105,7 +1105,7 @@ export function shouldRestartServer(
   expectedVersion = currentVersion,
 ) {
   if (!healthBody || typeof healthBody !== "object") return false;
-  if (forceRestart && healthBody.app === "lavish-axi" && healthBody.version === currentVersion) return true;
+  if (forceRestart && healthBody.app === "lavish-axi") return true;
   if (typeof healthBody.version !== "string" || healthBody.version === "") return true;
   return healthBody.version !== expectedVersion;
 }
