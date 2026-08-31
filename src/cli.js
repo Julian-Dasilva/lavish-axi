@@ -1026,10 +1026,12 @@ function isHtmlPath(file) {
 async function ensureServer({ forceRestart = false } = {}) {
   const port = defaultPort();
   const baseUrl = `http://${hostForUrl(clientHost())}:${port}`;
+  const expectedServerVersion = forceRestart ? localSourcePackageVersion() : VERSION;
   const existing = await fetchHealth(baseUrl);
-  if (existing && !shouldRestartServer(VERSION, existing, forceRestart)) {
+  if (existing && !shouldRestartServer(VERSION, existing, forceRestart, expectedServerVersion)) {
     return baseUrl;
   }
+  const replacementAttempted = Boolean(existing);
   if (existing) {
     if (!(await canControlServerOnPort(port, existing, processOnPortMatchesLavish))) {
       throw new AxiError(`Port ${port} is occupied by a non-Lavish server`, "SERVER_ERROR", [
@@ -1054,8 +1056,14 @@ async function ensureServer({ forceRestart = false } = {}) {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     const health = await fetchHealth(baseUrl);
-    if (health && !shouldRestartServer(VERSION, health)) {
-      return baseUrl;
+    if (health && !shouldRestartServer(VERSION, health, false, expectedServerVersion)) return baseUrl;
+    if (replacementAttempted && hasServerVersionMismatch(expectedServerVersion, health)) {
+      throw createServerVersionMismatchError({
+        port,
+        cliVersion: VERSION,
+        serverVersion: health.version,
+        commandLine: processCommandLineOnPort(port),
+      });
     }
     await delay(100);
   }
@@ -1064,15 +1072,30 @@ async function ensureServer({ forceRestart = false } = {}) {
   ]);
 }
 
+export function createServerVersionMismatchError({ port, cliVersion, serverVersion, commandLine }) {
+  const runningVersion = typeof serverVersion === "string" && serverVersion ? serverVersion : "missing";
+  const runningCommand = commandLine || "unavailable";
+  return new AxiError(
+    `Lavish Editor server version mismatch: CLI ${cliVersion}, running server ${runningVersion}; command line: ${runningCommand}`,
+    "SERVER_ERROR",
+    [`Run \`lavish-axi server --port ${port}\` to inspect server startup`],
+  );
+}
+
 // Pure helper so the upgrade-detection logic is unit-testable without spinning up HTTP.
 // Returns true when the running server is a different (or pre-handshake) version than
 // what this CLI was built with - i.e. the user just upgraded and the stale server needs
 // to step aside.
-export function shouldRestartServer(currentVersion, healthBody, forceRestart = false) {
+export function shouldRestartServer(
+  currentVersion,
+  healthBody,
+  forceRestart = false,
+  expectedVersion = currentVersion,
+) {
   if (!healthBody || typeof healthBody !== "object") return false;
-  if (forceRestart && healthBody.app === "lavish-axi") return true;
+  if (forceRestart && healthBody.app === "lavish-axi" && healthBody.version === currentVersion) return true;
   if (typeof healthBody.version !== "string" || healthBody.version === "") return true;
-  return healthBody.version !== currentVersion;
+  return healthBody.version !== expectedVersion;
 }
 
 export function shouldForceRestartForLocalBuild(executablePath, sourceServerExists = localSourceServerExists()) {
@@ -1082,6 +1105,17 @@ export function shouldForceRestartForLocalBuild(executablePath, sourceServerExis
 
 function localSourceServerExists() {
   return existsSync(fileURLToPath(new URL("../src/server.js", import.meta.url)));
+}
+
+function localSourcePackageVersion() {
+  return JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+}
+
+function hasServerVersionMismatch(expectedVersion, healthBody) {
+  return (
+    healthBody?.app === "lavish-axi" &&
+    (typeof healthBody.version !== "string" || healthBody.version === "" || healthBody.version !== expectedVersion)
+  );
 }
 
 export function shouldKillProcessOnPort(currentVersion, healthBody) {
@@ -1149,21 +1183,28 @@ function killProcessOnPort(port) {
 }
 
 function processOnPortMatchesLavish(port) {
+  return processCommandLinesOnPort(port).some((command) => /lavish-axi/.test(command));
+}
+
+function processCommandLineOnPort(port) {
+  return processCommandLinesOnPort(port)[0] || "";
+}
+
+function processCommandLinesOnPort(port) {
+  const commands = [];
   try {
     const pids = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
-    if (pids.status !== 0) return false;
+    if (pids.status !== 0) return commands;
     for (const line of pids.stdout.split("\n")) {
       const pid = Number(line.trim());
       if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
       const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
-      if (command.status === 0 && /lavish-axi/.test(command.stdout)) {
-        return true;
-      }
+      if (command.status === 0 && command.stdout.trim()) commands.push(command.stdout.trim());
     }
   } catch {
-    return false;
+    return commands;
   }
-  return false;
+  return commands;
 }
 
 async function startServer(port) {

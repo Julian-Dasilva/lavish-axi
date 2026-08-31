@@ -25,6 +25,7 @@ import {
   createPollOutput,
   createPlaybookOutput,
   createServerSpawnOptions,
+  createServerVersionMismatchError,
   createShareOutput,
   createUserEndedOpenOutput,
   detectInvokingAgent,
@@ -1939,6 +1940,27 @@ test("shouldRestartServer reuses a server running the same version", () => {
 test("shouldRestartServer restarts same-version Lavish servers when forced", () => {
   assert.equal(shouldRestartServer("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.4" }, true), true);
   assert.equal(shouldRestartServer("0.1.4", { ok: true, app: "other", version: "0.1.4" }, true), false);
+});
+
+test("local-build CLI accepts a local-source server with the source package version", () => {
+  assert.equal(
+    shouldRestartServer("0.1.62", { ok: true, app: "lavish-axi", version: "0.1.63" }, true, "0.1.63"),
+    false,
+  );
+});
+
+test("server version mismatch diagnostic names both versions and the command line", () => {
+  const error = createServerVersionMismatchError({
+    port: 4387,
+    cliVersion: "0.1.62",
+    serverVersion: "0.1.63",
+    commandLine: "node /repo/bin/lavish-axi.js server --port 4387",
+  });
+
+  assert.equal(error.code, "SERVER_ERROR");
+  assert.match(error.message, /CLI 0\.1\.62/);
+  assert.match(error.message, /running server 0\.1\.63/);
+  assert.match(error.message, /node \/repo\/bin\/lavish-axi\.js server --port 4387/);
 });
 
 test("shouldRestartServer restarts when the running server reports a different version", () => {
