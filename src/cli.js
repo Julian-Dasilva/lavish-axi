@@ -1023,12 +1023,23 @@ function isHtmlPath(file) {
   return file.toLowerCase().endsWith(".html") || file.toLowerCase().endsWith(".htm");
 }
 
-async function ensureServer({ forceRestart = false } = {}) {
-  const port = defaultPort();
+export async function ensureServer({
+  forceRestart = false,
+  port = defaultPort(),
+  executablePath = process.argv[1] || "",
+  sourceServerExists = undefined,
+  sourceVersionReader = localSourcePackageVersion,
+  expectedServerVersion = undefined,
+  requestShutdown: shutdownRequester = requestShutdown,
+  waitForPortFree: portFreeWaiter = waitForPortFree,
+  startServer: serverStarter = startServer,
+  processCommandLine: commandLineReader = processCommandLineOnPort,
+} = {}) {
   const baseUrl = `http://${hostForUrl(clientHost())}:${port}`;
-  const expectedServerVersion = forceRestart ? localSourcePackageVersion() : VERSION;
+  const localBuild = shouldForceRestartForLocalBuild(executablePath, sourceServerExists);
+  const serverVersion = expectedServerVersion ?? (localBuild ? sourceVersionReader() : VERSION);
   const existing = await fetchHealth(baseUrl);
-  if (existing && !shouldRestartServer(VERSION, existing, forceRestart, expectedServerVersion)) {
+  if (existing && !shouldRestartServer(VERSION, existing, forceRestart, serverVersion)) {
     return baseUrl;
   }
   const replacementAttempted = Boolean(existing);
@@ -1040,29 +1051,29 @@ async function ensureServer({ forceRestart = false } = {}) {
     }
     // Stale server from an older release is squatting on the port. Ask it to shut down
     // gracefully so the upgraded client doesn't keep handing users an old chrome.
-    await requestShutdown(baseUrl);
-    const freed = await waitForPortFree(baseUrl, 2000);
+    await shutdownRequester(baseUrl);
+    const freed = await portFreeWaiter(baseUrl, 2000);
     if (!freed) {
       // Pre-handshake servers (any release older than this change) don't expose /shutdown
       // so the POST 404'd. Fall back to SIGTERM by PID so the very first upgrade still
       // works, then keep waiting.
       if (shouldKillProcessOnPort(VERSION, existing)) {
         killProcessOnPort(port);
-        await waitForPortFree(baseUrl, 3000);
+        await portFreeWaiter(baseUrl, 3000);
       }
     }
   }
-  await startServer(port);
+  await serverStarter(port);
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     const health = await fetchHealth(baseUrl);
-    if (health && !shouldRestartServer(VERSION, health, false, expectedServerVersion)) return baseUrl;
-    if (replacementAttempted && hasServerVersionMismatch(expectedServerVersion, health)) {
+    if (health && !shouldRestartServer(VERSION, health, false, serverVersion)) return baseUrl;
+    if (replacementAttempted && hasServerVersionMismatch(serverVersion, health)) {
       throw createServerVersionMismatchError({
         port,
-        cliVersion: VERSION,
+        expectedVersion: serverVersion,
         serverVersion: health.version,
-        commandLine: processCommandLineOnPort(port),
+        commandLine: commandLineReader(port),
       });
     }
     await delay(100);
@@ -1072,11 +1083,12 @@ async function ensureServer({ forceRestart = false } = {}) {
   ]);
 }
 
-export function createServerVersionMismatchError({ port, cliVersion, serverVersion, commandLine }) {
+export function createServerVersionMismatchError({ port, expectedVersion, serverVersion, commandLine }) {
+  const comparedVersion = typeof expectedVersion === "string" && expectedVersion ? expectedVersion : "unknown";
   const runningVersion = typeof serverVersion === "string" && serverVersion ? serverVersion : "missing";
   const runningCommand = commandLine || "unavailable";
   return new AxiError(
-    `Lavish Editor server version mismatch: CLI ${cliVersion}, running server ${runningVersion}; command line: ${runningCommand}`,
+    `Lavish Editor server version mismatch: expected server ${comparedVersion}, running server ${runningVersion}; command line: ${runningCommand}`,
     "SERVER_ERROR",
     [`Run \`lavish-axi server --port ${port}\` to inspect server startup`],
   );
