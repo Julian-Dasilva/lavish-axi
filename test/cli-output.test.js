@@ -25,9 +25,11 @@ import {
   createPollOutput,
   createPlaybookOutput,
   createServerSpawnOptions,
+  createServerVersionMismatchError,
   createShareOutput,
   createUserEndedOpenOutput,
   detectInvokingAgent,
+  ensureServer,
   fetchJson,
   getCommandHelp,
   normalizeArgv,
@@ -1939,6 +1941,128 @@ test("shouldRestartServer reuses a server running the same version", () => {
 test("shouldRestartServer restarts same-version Lavish servers when forced", () => {
   assert.equal(shouldRestartServer("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.4" }, true), true);
   assert.equal(shouldRestartServer("0.1.4", { ok: true, app: "other", version: "0.1.4" }, true), false);
+});
+
+test("ensureServer accepts a local-source server for every local-build execution surface", async () => {
+  const server = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, app: "lavish-axi", version: "0.1.63" }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(undefined)));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("fake health server did not bind");
+
+  try {
+    const baseUrl = await ensureServer({
+      port: address.port,
+      executablePath: `${fileURLToPath(new URL("..", import.meta.url))}/dist/cli.mjs`,
+      sourceServerExists: true,
+      sourceVersionReader: () => "0.1.63",
+    });
+
+    assert.equal(baseUrl, `http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("ensureServer refreshes a local-source server once before accepting its source version", async () => {
+  let shutdowns = 0;
+  let starts = 0;
+  const server = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, app: "lavish-axi", version: "0.1.63" }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(undefined)));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("fake health server did not bind");
+
+  try {
+    const baseUrl = await ensureServer({
+      forceRestart: true,
+      port: address.port,
+      executablePath: `${fileURLToPath(new URL("..", import.meta.url))}/dist/cli.mjs`,
+      sourceServerExists: true,
+      sourceVersionReader: () => "0.1.63",
+      requestShutdown: async () => {
+        shutdowns += 1;
+      },
+      waitForPortFree: async () => true,
+      startServer: async () => {
+        starts += 1;
+      },
+    });
+
+    assert.equal(baseUrl, `http://127.0.0.1:${address.port}`);
+    assert.equal(shutdowns, 1);
+    assert.equal(starts, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("server version mismatch diagnostic names both versions and the command line", () => {
+  const error = createServerVersionMismatchError({
+    port: 4387,
+    expectedVersion: "0.1.64",
+    serverVersion: "0.1.63",
+    commandLine: "node /repo/bin/lavish-axi.js server --port 4387",
+  });
+
+  assert.equal(error.code, "SERVER_ERROR");
+  assert.match(error.message, /expected server 0\.1\.64/);
+  assert.match(error.message, /running server 0\.1\.63/);
+  assert.match(error.message, /node \/repo\/bin\/lavish-axi\.js server --port 4387/);
+});
+
+test("ensureServer bounds a persistent version mismatch after one replacement", async () => {
+  let shutdowns = 0;
+  const server = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, app: "lavish-axi", version: "0.1.63" }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(undefined)));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("fake health server did not bind");
+
+  try {
+    await assert.rejects(
+      () =>
+        ensureServer({
+          port: address.port,
+          expectedServerVersion: "0.1.62",
+          requestShutdown: async () => {
+            shutdowns += 1;
+          },
+          waitForPortFree: async () => true,
+          startServer: async () => {},
+          processCommandLine: () => "node /repo/bin/lavish-axi.js server --port 4387",
+        }),
+      (error) => {
+        if (!(error instanceof AxiError)) return false;
+        assert.equal(error.code, "SERVER_ERROR");
+        assert.match(error.message, /expected server 0\.1\.62/);
+        assert.match(error.message, /running server 0\.1\.63/);
+        assert.match(error.message, /node \/repo\/bin\/lavish-axi\.js server --port 4387/);
+        return true;
+      },
+    );
+    assert.equal(shutdowns, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("shouldRestartServer restarts when the running server reports a different version", () => {
